@@ -152,7 +152,7 @@ conf.addons_path=/opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons,/mnt/s
 
 ```bash
 # Clone the project
-git clone <repo-url> jdoo
+git clone https://github.com/autocme/jdoo.git
 cd jdoo
 
 # Configure
