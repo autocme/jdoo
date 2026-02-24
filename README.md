@@ -16,6 +16,18 @@ Universal Odoo Docker setup. One configuration, all versions (15.0 - 19.0+).
 - **JCICD integration** — optional external volume for synced addons via CI/CD pipeline
 - **Architecture support** — amd64 and arm64
 
+## Dependencies
+
+| Project | Role | Description |
+|---------|------|-------------|
+| [autocme/oc](https://github.com/autocme/oc) | **Build-time** | Optimized Odoo source code (~80% smaller than official), cloned into the Docker image via `ODOO_REPO` |
+| [autocme/oa](https://github.com/autocme/oa) | **Runtime** | Odoo core addons, synced to `/repos/{version}/oa` by JCICD |
+| [autocme/JCICD](https://github.com/autocme/JCICD) | **CI/CD** (optional) | Pipeline engine that syncs repos, triggers upgrades, and manages deployments |
+
+> **oc vs oa**: `oc` is the Odoo source baked into the Docker image at build time.
+> `oa` is the addons repo synced at runtime by JCICD into `/repos/{version}/oa`.
+> To use the official Odoo repo instead of `oc`, set `ODOO_REPO=https://github.com/odoo/odoo.git` in `.env`.
+
 ## Quick Start
 
 ### Local Development (with `./jdoo` wrapper)
@@ -70,8 +82,6 @@ docker compose up -d --build
 | 17.0         | 3.12           | 16         |
 | 18.0         | 3.12           | 16         |
 | 19.0         | **3.12** (default) | **17** (default) |
-
-With `./jdoo` or `compute-env.sh`: only `ODOO_VERSION` is required — the rest is auto-computed.
 
 ## Deploying on Dokploy
 
@@ -240,22 +250,26 @@ All configuration is done through `.env`. The `docker-compose.yml` never needs d
 
 ### Auto-Computed Resources (from container CPU/RAM)
 
-| Variable | Rule | Description |
-|----------|------|-------------|
-| `WORKERS` | CPU * 2 (min 2) | Odoo HTTP worker processes |
-| `MAX_CRON_THREADS` | 1 if workers < 6, else 2 | Cron worker threads |
-| `LIMIT_MEMORY_SOFT` | (85% RAM) / procs | Per-worker soft memory limit (bytes) |
-| `LIMIT_MEMORY_HARD` | soft * 1.3 | Per-worker hard memory limit (bytes) |
+| Variable | Description |
+|----------|-------------|
+| `WORKERS` | Odoo HTTP worker processes |
+| `MAX_CRON_THREADS` | Cron worker threads |
+| `LIMIT_MEMORY_SOFT` | Per-worker soft memory limit (bytes) |
+| `LIMIT_MEMORY_HARD` | Per-worker hard memory limit (bytes) |
+
+> Formulas and examples: see [Step 2: Resource Auto-Tuning](#step-2-resource-auto-tuning).
 
 ### Auto-Computed PostgreSQL (from container RAM)
 
-| Variable | Rule | Description |
-|----------|------|-------------|
-| `PG_SHARED_BUFFERS` | min(25% RAM, 4GB) | PostgreSQL shared buffers |
-| `PG_EFFECTIVE_CACHE_SIZE` | 50% RAM | Query planner cache hint |
-| `PG_WORK_MEM` | 64MB | Per-operation sort/hash memory |
-| `PG_MAINTENANCE_WORK_MEM` | min(10% RAM, 2GB) | VACUUM/CREATE INDEX memory |
-| `PG_MAX_CONNECTIONS` | 100 | Maximum database connections |
+| Variable | Description |
+|----------|-------------|
+| `PG_SHARED_BUFFERS` | PostgreSQL shared buffers |
+| `PG_EFFECTIVE_CACHE_SIZE` | Query planner cache hint |
+| `PG_WORK_MEM` | Per-operation sort/hash memory |
+| `PG_MAINTENANCE_WORK_MEM` | VACUUM/CREATE INDEX memory |
+| `PG_MAX_CONNECTIONS` | Maximum database connections |
+
+> Formulas and examples: see [PostgreSQL Auto-Tuning](#postgresql-auto-tuning).
 
 ### Security
 
@@ -272,7 +286,7 @@ All configuration is done through `.env`. The `docker-compose.yml` never needs d
 | `LONGPOLLING_PORT` | `8072` | Host port for longpolling/websocket |
 | `PUID` | `1000` | Container user UID (match host user) |
 | `PGID` | `1000` | Container group GID (match host user) |
-| `ODOO_REPO` | `autocme/oc` | Git repository for Odoo source |
+| `ODOO_REPO` | [`autocme/oc`](https://github.com/autocme/oc) | Odoo source code repo cloned at build time (see [Dependencies](#dependencies)) |
 
 ### Features
 
