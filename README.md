@@ -43,7 +43,13 @@ ODOO_VERSION=19.0
 # 2. Auto-compute PYTHON_VERSION and PG_VERSION
 bash compute-env.sh
 
-# 3. Build and start
+# 3. Build and start (with resource limits)
+docker compose up -d --build \
+  --scale odoo=1 \
+  && docker update --cpus 4 --memory 8g $(docker compose ps -q odoo) \
+  && docker update --cpus 2 --memory 4g $(docker compose ps -q db)
+
+# Or simply without resource limits (auto-detects host resources)
 docker compose up -d --build
 
 # 4. Open Odoo
@@ -52,6 +58,8 @@ docker compose up -d --build
 
 > `compute-env.sh` auto-computes `PYTHON_VERSION` and `PG_VERSION` from `ODOO_VERSION`.
 > Workers, memory, and PostgreSQL tuning are auto-computed inside containers.
+> When resource limits are set (via `docker update` or `deploy.resources` in compose),
+> the entrypoint auto-tunes workers/memory based on the **container's** allocated resources, not the host.
 
 ## Version Matrix
 
@@ -90,15 +98,13 @@ With `./jdoo` or `compute-env.sh`: only `ODOO_VERSION` is required — the rest 
 
 ### Addons on Dokploy
 
-The default `conf.addons_path` includes these directories:
+The default `conf.addons_path` includes:
 
 ```
-/opt/odoo/addons          # Odoo built-in addons (from source)
-/opt/odoo/odoo/addons     # Odoo core addons (from source)
-/mnt/extra-addons         # Custom addons volume (mounted read-only)
-/repos/{version}/oa       # JCICD repos (read-only, if mounted)
-/repos/{version}/mail     # JCICD mail addons (read-only, if mounted)
+/repos/{version}/oa       # Odoo core addons via JCICD (read-only, if mounted)
 ```
+
+> `oa` is [autocme/oa](https://github.com/autocme/oa) — Odoo core addons synced by JCICD.
 
 **Adding custom addons:** Create a `docker-compose.override.yml` in your repo to mount an external volume:
 
@@ -328,6 +334,42 @@ The entrypoint detects container CPU and RAM (via cgroup v2/v1 or `/proc`) and c
 
 Override any value in `.env` (e.g., `WORKERS=4`). If set, auto-compute is skipped for that variable.
 
+**Setting container resource limits:**
+
+Use `docker-compose.override.yml` to allocate specific CPU/RAM per container:
+
+```yaml
+services:
+  odoo:
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "2"
+          memory: 4G
+  db:
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 2G
+```
+
+Or apply limits at runtime:
+
+```bash
+docker update --cpus 4 --memory 8g <odoo-container>
+docker update --cpus 2 --memory 4g <db-container>
+```
+
+> The entrypoint reads **container** limits (not host), so setting `--cpus 4 --memory 8g`
+> on a 32-core host will compute workers/memory based on 4 CPUs and 8GB.
+
 ### PostgreSQL Auto-Tuning
 
 The `pg-auto-tune.sh` script wraps the PostgreSQL Docker entrypoint. It detects container RAM and computes:
@@ -507,11 +549,7 @@ docker exec <container> /usr/local/bin/addons-path.sh
 ```
 
 ```
-/opt/odoo/addons
-/opt/odoo/odoo/addons
-/mnt/extra-addons
 /repos/19.0/oa
-/repos/19.0/mail
 ```
 
 ## Container Health States

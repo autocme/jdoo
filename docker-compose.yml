@@ -103,8 +103,8 @@ services:
       # Admin password
       conf.admin_passwd: ${ODOO_ADMIN_PASSWORD:-admin_}
 
-      # Addons paths (entrypoint auto-detects available addon directories)
-      conf.addons_path: "/opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons,/repos/${ODOO_VERSION:-19.0}/oa,/repos/${ODOO_VERSION:-19.0}/mail"
+      # Addons path — oa = Odoo core addons (https://github.com/autocme/oa)
+      conf.addons_path: "/repos/${ODOO_VERSION:-19.0}/oa"
 
       # Data directory
       conf.data_dir: /var/lib/odoo
