@@ -1,0 +1,169 @@
+# =============================================================================
+# jdoo - Universal Odoo Docker Compose (Supports Odoo 15.0 - 19.0+)
+# =============================================================================
+# Works with both ./jdoo wrapper (local dev) and plain docker compose (Dokploy).
+#
+# Local development:
+#   ./jdoo up -d --build                                  # auto-computes everything
+#
+# Dokploy / direct docker compose:
+#   bash compute-env.sh && docker compose up -d --build   # auto-computes versions
+#
+# Version Matrix (set in .env):
+#   ODOO_VERSION | PYTHON_VERSION | PG_VERSION
+#   15.0         | 3.10           | 14
+#   16.0         | 3.10           | 15
+#   17.0         | 3.12           | 16
+#   18.0         | 3.12           | 16
+#   19.0         | 3.12 (default) | 17 (default)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # Auto-tuned: pg-auto-tune.sh computes shared_buffers, cache, etc. from RAM
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:${PG_VERSION:-17}-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-db
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/pg-auto-tune.sh"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-odoo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-odoo}
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # PG tuning overrides (empty = auto-computed from container RAM)
+      PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-}
+      PG_EFFECTIVE_CACHE_SIZE: ${PG_EFFECTIVE_CACHE_SIZE:-}
+      PG_WORK_MEM: ${PG_WORK_MEM:-}
+      PG_MAINTENANCE_WORK_MEM: ${PG_MAINTENANCE_WORK_MEM:-}
+      PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./pg-auto-tune.sh:/usr/local/bin/pg-auto-tune.sh:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-odoo} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Odoo Application
+  # Auto-tuned: entrypoint.sh computes workers, memory limits from CPU/RAM
+  # ---------------------------------------------------------------------------
+  odoo:
+    image: jdoo:${ODOO_VERSION:-19.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ODOO_VERSION: ${ODOO_VERSION:-19.0}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        ODOO_REPO: ${ODOO_REPO:-https://github.com/autocme/oc.git}
+    container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-app
+    restart: unless-stopped
+    labels:
+      restart-after: "${ODOO_VERSION:-19.0}/oa"
+      cicd-role: "${CICD_ROLE:-staging}"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${ODOO_PORT:-8069}:${ODOO_PORT:-8069}"
+      - "${LONGPOLLING_PORT:-8072}:8072"
+    volumes:
+      # Persistent data (filestore, sessions, logs)
+      - odoo-data:/var/lib/odoo
+
+      # Custom addons (read-only)
+      - ./extra-addons:/mnt/extra-addons:ro
+
+      # Repos volume - synced addons from JCICD (read-only)
+      - repos:/repos:ro
+
+    environment:
+      # User/Group IDs
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+
+      # -------------------------------------------------------------------
+      # Odoo Configuration (conf.* -> /etc/odoo/erp.conf)
+      # -------------------------------------------------------------------
+      # Database
+      conf.db_host: db
+      conf.db_port: 5432
+      conf.db_user: ${POSTGRES_USER:-odoo}
+      conf.db_password: ${POSTGRES_PASSWORD:-odoo}
+      conf.db_name: "False"
+      conf.db_template: template0
+
+      # Admin password
+      conf.admin_passwd: ${ODOO_ADMIN_PASSWORD:-admin_}
+
+      # Addons paths (entrypoint auto-detects available addon directories)
+      conf.addons_path: "/opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons,/repos/${ODOO_VERSION:-19.0}/oa,/repos/${ODOO_VERSION:-19.0}/mail"
+
+      # Data directory
+      conf.data_dir: /var/lib/odoo
+
+      # Logging
+      conf.logfile: /var/lib/odoo/logs/odoo.log
+      conf.log_level: info
+      conf.log_handler: ":INFO"
+
+      # HTTP (ODOO_PORT is unified: same port inside and outside container)
+      ODOO_PORT: ${ODOO_PORT:-8069}
+      conf.http_port: ${ODOO_PORT:-8069}
+      conf.longpolling_port: ${LONGPOLLING_PORT:-8072}
+      conf.proxy_mode: "True"
+      conf.limit_time_cpu: 600
+      conf.limit_time_real: 1200
+      conf.limit_time_real_cron: 0
+
+      # Resource allocation (auto-computed in entrypoint, override via .env)
+      WORKERS: ${WORKERS:-}
+      MAX_CRON_THREADS: ${MAX_CRON_THREADS:-}
+      LIMIT_MEMORY_SOFT: ${LIMIT_MEMORY_SOFT:-}
+      LIMIT_MEMORY_HARD: ${LIMIT_MEMORY_HARD:-}
+      RESOURCE_WATCHER: ${RESOURCE_WATCHER:-FALSE}
+
+      # -------------------------------------------------------------------
+      # Features
+      # -------------------------------------------------------------------
+      AUTO_UPGRADE: ${AUTO_UPGRADE:-FALSE}
+      UPGRADE_IGNORE_CORE: ${UPGRADE_IGNORE_CORE:-TRUE}
+      ODOO_DB_NAME: ${ODOO_DB_NAME:-}
+      INITDB_OPTIONS: ${INITDB_OPTIONS:-}
+
+      # Fix report.url for wkhtmltopdf PDF rendering (TRUE/FALSE)
+      FIX_REPORT_URL: ${FIX_REPORT_URL:-FALSE}
+
+      # Runtime package installation
+      PY_INSTALL: ${PY_INSTALL:-phonenumbers,python-stdnum,num2words}
+      NPM_INSTALL: ${NPM_INSTALL:-rtlcss,less}
+
+    networks:
+      - internal
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  db-data:
+    driver: local
+
+  odoo-data:
+    driver: local
+
+  repos:
+    external: true
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,21 @@
+# =============================================================================
+# JCICD Integration - Docker Compose Override
+# =============================================================================
+# This file is auto-included by ./jdoo when SYNCER_VOLUME_NAME is set in .env.
+#
+# For Dokploy or manual use:
+#   docker compose -f docker-compose.yml -f docker-compose.syncer.yml up -d
+#
+# Or rename to docker-compose.override.yml for automatic inclusion:
+#   cp docker-compose.syncer.yml docker-compose.override.yml
+# =============================================================================
+
+services:
+  odoo:
+    volumes:
+      - syncer_addons:/mnt/synced-addons:ro
+
+volumes:
+  syncer_addons:
+    external: true
+    name: ${SYNCER_VOLUME_NAME}
