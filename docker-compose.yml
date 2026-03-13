@@ -51,9 +51,9 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
-  # Nginx Reverse Proxy
-  # Routes /websocket/ to gevent worker, everything else to HTTP workers.
-  # Required for LiveChat, Discuss, and real-time features in multi-worker mode.
+  # Nginx Internal Proxy
+  # Routes /websocket → gevent (8072), everything else → HTTP workers (8069).
+  # No ports exposed — Dokploy Traefik routes to nginx:8069 via internal network.
   # ---------------------------------------------------------------------------
   nginx:
     image: nginx:alpine
@@ -61,10 +61,8 @@ services:
     restart: unless-stopped
     depends_on:
       - odoo
-    ports:
-      - "${ODOO_PORT:-8069}:${ODOO_PORT:-8069}"
     environment:
-      ODOO_PORT: ${ODOO_PORT:-8069}
+      ODOO_PORT: "8069"
     volumes:
       - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
     networks:
