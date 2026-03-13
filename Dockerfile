@@ -46,6 +46,11 @@ RUN set -eux; \
     rm -rf /opt/odoo/.git; \
     mkdir -p /opt/odoo/addons
 
+# Suppress build-time warnings (container build — running as root is expected)
+ENV PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 # Install Python dependencies (version-aware)
 RUN set -eux; \
     pip install --no-cache-dir --upgrade pip wheel; \
@@ -110,6 +115,10 @@ ENV ODOO_VERSION=${ODOO_VERSION} \
     ERP_CONF_PATH=/etc/odoo/erp.conf \
     ODOO_DATA_DIR=/var/lib/odoo \
     ODOO_PORT=8069 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
     PUID=1000 \
     PGID=1000 \
     AUTO_UPGRADE=FALSE \
@@ -210,7 +219,8 @@ RUN set -eux; \
 RUN set -eux; \
     curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -; \
     apt-get install -y --no-install-recommends nodejs; \
-    npm install -g npm@latest; \
+    npm install -g npm@latest 2>&1 | grep -v "^npm warn"; \
+    npm config set update-notifier false; \
     rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
