@@ -410,16 +410,16 @@ install_python_packages() {
             local pkg_name="${pkg%%==*}"
             local pkg_version="${pkg#*==}"
 
-            if pip show --quiet "$pkg_name" 2>/dev/null | grep -q "Version: $pkg_version"; then
+            if pip show "$pkg_name" 2>/dev/null | grep -q "Version: $pkg_version"; then
                 log_info "  [ok] $pkg already installed"
             else
                 log_info "  [need] $pkg needs installation/upgrade"
                 needs_install=true
             fi
         else
-            if pip show --quiet "$pkg" &>/dev/null; then
+            if pip show "$pkg" &>/dev/null; then
                 local installed_version
-                installed_version=$(pip show --quiet "$pkg" 2>/dev/null | grep "Version:" | awk '{print $2}')
+                installed_version=$(pip show "$pkg" 2>/dev/null | grep "Version:" | awk '{print $2}' || echo "unknown")
                 log_info "  [ok] $pkg already installed (version: $installed_version)"
             else
                 log_info "  [need] $pkg needs installation"
@@ -483,7 +483,7 @@ install_npm_packages() {
 
         local packages="${npm_install//,/ }"
 
-        if npm install -g --loglevel=warn $packages 2>&1 | grep -v "^npm warn"; then
+        if npm install -g --fund=false --loglevel=warn $packages 2>&1 | grep -v "^npm warn"; then
             log_info "NPM packages installed successfully."
         else
             log_error "Failed to install NPM packages!"
