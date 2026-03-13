@@ -5,7 +5,7 @@ Universal Odoo Docker setup. One configuration, all versions (15.0 - 19.0+).
 ## Features
 
 - **One-command version switching** — change `ODOO_VERSION` and rebuild
-- **Auto-computed settings** — Python, PostgreSQL, port, and project name derived automatically
+- **Auto-computed settings** — Python, PostgreSQL, and project name derived automatically
 - **Auto-tuned resources** — workers, memory limits, and PostgreSQL computed from CPU/RAM
 - **Resource watcher** — optional live monitoring that reconfigures on resource changes
 - **Dokploy / PaaS ready** — works with plain `docker compose` without wrapper scripts
@@ -41,10 +41,10 @@ nano .env                     # set ODOO_VERSION and passwords
 ./jdoo up -d --build
 
 # 3. Open Odoo
-# http://localhost:8019  (port = 80 + major version)
+# http://localhost:8069  (override via ODOO_PORT in .env)
 ```
 
-> `./jdoo` auto-computes PYTHON_VERSION, PG_VERSION, ODOO_PORT, and COMPOSE_PROJECT_NAME.
+> `./jdoo` auto-computes PYTHON_VERSION, PG_VERSION, and COMPOSE_PROJECT_NAME.
 
 ### Dokploy / Direct Docker Compose
 
@@ -106,6 +106,27 @@ docker compose up -d --build
 - **Odoo container**: workers, cron threads, memory limits (from CPU/RAM via cgroups)
 - **PG container**: shared_buffers, effective_cache_size, work_mem, maintenance_work_mem (from RAM)
 
+### WebSocket / LiveChat Proxy
+
+When `workers > 0` (multi-processing mode), Odoo starts a dedicated **gevent worker** for LiveChat and WebSocket on port `8072` (configurable via `LONGPOLLING_PORT`).
+
+Your reverse proxy (Dokploy/nginx/Traefik) **must** route `/websocket/` requests to the gevent port:
+
+```nginx
+# Nginx example
+location /websocket/ {
+    proxy_pass http://odoo:8072;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+> **Note:** `proxy_mode = True` is already set by default. The entrypoint auto-computes resource allocation including the gevent worker in RAM calculations.
+
 ### Addons on Dokploy
 
 The default `conf.addons_path` includes:
@@ -128,25 +149,7 @@ volumes:
     external: true
 ```
 
-**With JCICD:** Mount the syncer volume and the entrypoint auto-detects it:
-
-```yaml
-services:
-  odoo:
-    volumes:
-      - repos:/mnt/synced-addons:ro
-volumes:
-  repos:
-    external: true
-```
-
-> The entrypoint automatically adds `/mnt/synced-addons` to `conf.addons_path` when content is detected.
-
-**Extending addons_path:** To add extra directories, override `conf.addons_path` in the Dokploy UI:
-
-```
-conf.addons_path=/opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons,/mnt/synced-addons
-```
+**With JCICD:** The `repos` external volume is already mounted at `/repos` (read-only) in `docker-compose.yml`. JCICD syncs repos into `/repos/{version}/{repo}` (e.g., `/repos/19.0/oa`). The `conf.addons_path` is pre-configured to use it.
 
 ## Full Example: Deploy Odoo 17
 
@@ -190,7 +193,7 @@ INITDB_OPTIONS=-n mydb -m base,web --unless-initialized
 Output:
 
 ```
-[jdoo] Odoo 17.0 | Python 3.12 | PG 16 | Port 8017 | Project jdoo17
+[jdoo] Odoo 17.0 | Python 3.12 | PG 16 | Port 8069 | Project jdoo17
 [jdoo] PG: shared=2048MB | cache=4096MB | work=64MB | maint=819MB | conn=100
 ```
 
@@ -207,7 +210,7 @@ nano .env    # change ODOO_VERSION=18.0
 ./jdoo up -d --build
 ```
 
-Each version gets its own containers, volumes, and port automatically — no conflicts.
+Each version gets its own containers and volumes automatically — no conflicts.
 
 ## Project Structure
 
@@ -217,7 +220,6 @@ jdoo/
 ├── .gitignore                # Protects .env and sensitive files
 ├── Dockerfile                # Multi-stage build (builder + runtime)
 ├── docker-compose.yml        # Services, volumes, networks
-├── docker-compose.syncer.yml # JCICD volume override (optional)
 ├── entrypoint.sh             # 9-step Odoo startup orchestration
 ├── healthcheck.sh            # Smart healthcheck with state awareness
 ├── upgrade.sh                # Standalone upgrade script (callable via docker exec)
@@ -245,7 +247,7 @@ All configuration is done through `.env`. The `docker-compose.yml` never needs d
 |----------|---------|-------------|
 | `PYTHON_VERSION` | `3.12` | Python base image (auto: `3.10` for Odoo 15-16) |
 | `PG_VERSION` | `17` | PostgreSQL version (auto: see Version Matrix) |
-| `ODOO_PORT` | `8069` | HTTP port (`./jdoo` sets `80+major`) |
+| `ODOO_PORT` | `8069` | HTTP port (override in `.env`) |
 | `COMPOSE_PROJECT_NAME` | `jdoo` | Container/volume prefix (`./jdoo` sets `jdoo+major`) |
 
 ### Auto-Computed Resources (from container CPU/RAM)
@@ -300,7 +302,6 @@ All configuration is done through `.env`. The `docker-compose.yml` never needs d
 | `NPM_INSTALL` | `rtlcss,less` | NPM packages installed at startup |
 | `FIX_REPORT_URL` | `FALSE` | Fix `report.url` for wkhtmltopdf PDF rendering inside container |
 | `RESOURCE_WATCHER` | `FALSE` | Monitor CPU/RAM changes and auto-restart Odoo |
-| `SYNCER_VOLUME_NAME` | *(empty)* | JCICD external volume name (auto-includes syncer compose) |
 | `CICD_ROLE` | `staging` | Container label for CI/CD role (`staging` / `production`) |
 
 ## Odoo Configuration (conf.*)
@@ -445,11 +446,52 @@ Mounted read-only at `/mnt/extra-addons`, already included in `addons_path`.
 
 **Disabled by default.** Create databases from the Odoo UI at `/web/database/manager`.
 
-To auto-create a database on first startup:
+To auto-create a database on first startup, set `INIT_DB` and any additional `INIT_*` variables:
+
+### INIT_* Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INIT_DB` | *(empty)* | Database name. **Required** to enable auto-creation. |
+| `INIT_LOGIN` | `admin` | Admin user login (email). |
+| `INIT_PASSWORD` | `admin` | Admin user password. |
+| `INIT_LANG` | `en_US` | Language code (`en_US`, `ar_001`, `fr_FR`, etc.). |
+| `INIT_COUNTRY` | *(empty)* | Country code (`US`, `SA`, `FR`, etc.). Empty = auto-detect. |
+| `INIT_PHONE` | *(empty)* | Admin phone number (`+966500000000`). Empty = skip. |
+| `INIT_DEMO` | `FALSE` | Load demo data (`TRUE` / `FALSE`). |
+| `INIT_MODULES` | *(empty)* | Comma-separated modules to install after creation (`base,web,sale,account`). |
+
+### Example
+
+```ini
+INIT_DB=mydb
+INIT_LOGIN=admin@mycompany.com
+INIT_PASSWORD=S3cure!Pass
+INIT_LANG=ar_001
+INIT_COUNTRY=SA
+INIT_PHONE=+966500000000
+INIT_DEMO=FALSE
+INIT_MODULES=base,web,sale,account
+```
+
+### How It Works
+
+1. **Check existence** — if the database already exists, creation is skipped (modules are still installed if `INIT_MODULES` is set).
+2. **Start Odoo temporarily** — a background Odoo process starts on the configured port (default `8069`) with no cron threads and no workers.
+3. **Create database via XML-RPC** — calls Odoo's native `/xmlrpc/2/db` `create_database` endpoint with all 7 supported fields (name, login, password, language, country, demo, master password).
+4. **Set phone** — if `INIT_PHONE` is set, updates the admin user's partner phone via `/xmlrpc/2/object`.
+5. **Install modules** — if `INIT_MODULES` is set, updates the module list and installs each module via `button_immediate_install`.
+6. **Stop temporary Odoo** — the background process is terminated before the main Odoo startup (Step 9).
+
+### Legacy Mode
+
+If `INIT_DB` is empty but `INITDB_OPTIONS` is set, the entrypoint falls back to `click-odoo-initdb`:
 
 ```ini
 INITDB_OPTIONS=-n mydb -m base,web --unless-initialized
 ```
+
+> **Note:** `click-odoo-initdb` only supports database name, modules, and demo flag. It does not support login, password, language, country, or phone. Use `INIT_*` variables for full control.
 
 ## Auto-Upgrade
 
@@ -756,7 +798,6 @@ These labels allow JCICD and other CI/CD tools to discover and manage containers
 │         │                          │                         │
 │    db-data vol               odoo-data vol                   │
 │                               extra-addons/ (ro)             │
-│                               repos/ (ro, JCICD)      │
-│                               synced-addons/ (optional)      │
+│                               repos/ (ro, JCICD)             │
 └─────────────────────────────────────────────────────────────┘
 ```

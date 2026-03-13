@@ -1,0 +1,9 @@
+services:
+  odoo:
+    environment:
+      INIT_DB: odoo
+      INIT_LOGIN: admin
+      INIT_PASSWORD: admin
+      INIT_LANG: en_US
+      INIT_DEMO: "FALSE"
+      conf.admin_passwd: admin

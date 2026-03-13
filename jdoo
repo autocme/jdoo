@@ -11,7 +11,6 @@
 # Auto-computed from ODOO_VERSION (override any in .env):
 #   PYTHON_VERSION       15-16 -> 3.10, 17+ -> 3.12
 #   PG_VERSION           15->14, 16->15, 17-18->16, 19+->17
-#   ODOO_PORT            80 + major (15.0 -> 8015)
 #   COMPOSE_PROJECT_NAME jdoo + major (15.0 -> jdoo15)
 #
 # Auto-computed from host RAM (override any in .env):
@@ -52,11 +51,6 @@ if [ -z "${PG_VERSION:-}" ]; then
         17|18) export PG_VERSION="16" ;;
         *) export PG_VERSION="17" ;;  # 19+
     esac
-fi
-
-# --- Auto-compute ODOO_PORT ---
-if [ -z "${ODOO_PORT:-}" ]; then
-    export ODOO_PORT="80${MAJOR}"
 fi
 
 # --- Auto-compute COMPOSE_PROJECT_NAME ---
@@ -120,11 +114,5 @@ echo "[jdoo] PG: shared=${PG_SHARED_BUFFERS} | cache=${PG_EFFECTIVE_CACHE_SIZE} 
 
 # --- Build compose file list ---
 COMPOSE_FILES="-f docker-compose.yml"
-
-# Auto-include JCICD override when SYNCER_VOLUME_NAME is set
-if [ -n "${SYNCER_VOLUME_NAME:-}" ]; then
-    COMPOSE_FILES="${COMPOSE_FILES} -f docker-compose.syncer.yml"
-    echo "[jdoo] Syncer: ${SYNCER_VOLUME_NAME}"
-fi
 
 exec docker compose ${COMPOSE_FILES} "$@"

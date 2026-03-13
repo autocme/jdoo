@@ -51,8 +51,29 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy
+  # Routes /websocket/ to gevent worker, everything else to HTTP workers.
+  # Required for LiveChat, Discuss, and real-time features in multi-worker mode.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-proxy
+    restart: unless-stopped
+    depends_on:
+      - odoo
+    ports:
+      - "${ODOO_PORT:-8069}:${ODOO_PORT:-8069}"
+    environment:
+      ODOO_PORT: ${ODOO_PORT:-8069}
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      - internal
+
+  # ---------------------------------------------------------------------------
   # Odoo Application
   # Auto-tuned: entrypoint.sh computes workers, memory limits from CPU/RAM
+  # Internal ports: 8069 (HTTP), 8072 (gevent/WebSocket) — nginx handles routing
   # ---------------------------------------------------------------------------
   odoo:
     image: jdoo:${ODOO_VERSION:-19.0}
@@ -71,9 +92,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "${ODOO_PORT:-8069}:${ODOO_PORT:-8069}"
-      - "${LONGPOLLING_PORT:-8072}:8072"
+    # No ports exposed to host — nginx handles external access
     volumes:
       # Persistent data (filestore, sessions, logs)
       - odoo-data:/var/lib/odoo
@@ -106,6 +125,9 @@ services:
       # Addons path — oa = Odoo core addons (https://github.com/autocme/oa)
       conf.addons_path: "/repos/${ODOO_VERSION:-19.0}/oa"
 
+      # GeoIP database (shipped in oa repo)
+      conf.geoip_city_db: "/repos/${ODOO_VERSION:-19.0}/oa/GeoIP/GeoLite2-City.mmdb"
+
       # Data directory
       conf.data_dir: /var/lib/odoo
 
@@ -114,10 +136,10 @@ services:
       conf.log_level: info
       conf.log_handler: ":INFO"
 
-      # HTTP (ODOO_PORT is unified: same port inside and outside container)
-      ODOO_PORT: ${ODOO_PORT:-8069}
-      conf.http_port: ${ODOO_PORT:-8069}
-      conf.longpolling_port: ${LONGPOLLING_PORT:-8072}
+      # HTTP — fixed internal ports (nginx handles external port mapping)
+      ODOO_PORT: "8069"
+      conf.http_port: 8069
+      conf.longpolling_port: 8072
       conf.proxy_mode: "True"
       conf.limit_time_cpu: 600
       conf.limit_time_real: 1200
@@ -136,6 +158,16 @@ services:
       AUTO_UPGRADE: ${AUTO_UPGRADE:-FALSE}
       UPGRADE_IGNORE_CORE: ${UPGRADE_IGNORE_CORE:-TRUE}
       ODOO_DB_NAME: ${ODOO_DB_NAME:-}
+
+      # Database initialization (INIT_* variables)
+      INIT_DB: ${INIT_DB:-}
+      INIT_LOGIN: ${INIT_LOGIN:-admin}
+      INIT_PASSWORD: ${INIT_PASSWORD:-admin}
+      INIT_LANG: ${INIT_LANG:-en_US}
+      INIT_COUNTRY: ${INIT_COUNTRY:-}
+      INIT_PHONE: ${INIT_PHONE:-}
+      INIT_DEMO: ${INIT_DEMO:-FALSE}
+      INIT_MODULES: ${INIT_MODULES:-}
       INITDB_OPTIONS: ${INITDB_OPTIONS:-}
 
       # Fix report.url for wkhtmltopdf PDF rendering (TRUE/FALSE)

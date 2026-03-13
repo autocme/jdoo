@@ -243,7 +243,13 @@ compute_resources() {
     # Odoo's limit_memory_soft/hard are PER WORKER limits
     # Formula: allocate 85% of RAM across all processes
     # Soft = per-worker allocation, Hard = soft * 1.3
-    local total_procs=$(( workers + max_cron_threads ))
+    # When workers > 0, Odoo auto-starts 1 gevent (LiveChat/WebSocket) worker
+    local gevent_workers=0
+    if [ "$workers" -gt 0 ]; then
+        gevent_workers=1
+    fi
+    local total_procs=$(( workers + max_cron_threads + gevent_workers ))
+    log_info "  Processes: ${workers} HTTP + ${max_cron_threads} cron + ${gevent_workers} gevent = ${total_procs} total"
 
     local limit_memory_soft
     if [ -n "${LIMIT_MEMORY_SOFT:-}" ]; then
@@ -283,9 +289,18 @@ compute_resources() {
     COMPUTED_LIMIT_MEMORY_SOFT="${limit_memory_soft}"
     COMPUTED_LIMIT_MEMORY_HARD="${limit_memory_hard}"
 
-    # Summary
+    # Summary using Odoo's official formula:
+    # RAM = total_procs * ((0.8 * 150MB) + (0.2 * 1024MB)) = ~325MB/proc (light avg)
+    # Our formula uses actual RAM / procs which is more generous
     local total_ram_needed=$(( (soft_mb * total_procs) ))
+    local odoo_estimate=$(( total_procs * 325 ))
     log_info "  Total estimated RAM: ~${total_ram_needed}MB for ${total_procs} processes"
+    log_info "  Odoo official estimate: ~${odoo_estimate}MB (${total_procs} × 325MB)"
+    if [ "$workers" -gt 0 ]; then
+        local gevent_port="${LONGPOLLING_PORT:-8072}"
+        log_info "  WebSocket/LiveChat: gevent worker on port ${gevent_port}"
+        log_info "  NOTE: Reverse proxy must route /websocket/ -> localhost:${gevent_port}"
+    fi
     log_info "Resource allocation complete."
 }
 
@@ -480,25 +495,250 @@ install_npm_packages() {
 }
 
 # -----------------------------------------------------------------------------
-# Step 6: Database Initialization with click-odoo-initdb
-# Uses --unless-initialized to skip if DB already exists
+# Helpers: Start/stop a temporary Odoo instance for XML-RPC operations
+# -----------------------------------------------------------------------------
+_TMP_ODOO_PID=""
+
+_start_temp_odoo() {
+    local port="$1"
+    log_info "Starting temporary Odoo on port ${port}..."
+    cd "$ODOO_SOURCE"
+    gosu odoo python odoo-bin -c "$ERP_CONF_PATH" --http-port="$port" \
+        --max-cron-threads=0 --workers=0 &
+    _TMP_ODOO_PID=$!
+
+    local waited=0
+    local max_wait=180
+    while [ $waited -lt $max_wait ]; do
+        if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${port}/web/database/manager" 2>/dev/null | grep -qE "200|303"; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        if [ $((waited % 20)) -eq 0 ]; then
+            log_info "  Waiting for Odoo... (${waited}s/${max_wait}s)"
+        fi
+    done
+
+    if [ $waited -ge $max_wait ]; then
+        log_error "Odoo did not start within ${max_wait} seconds."
+        _stop_temp_odoo
+        return 1
+    fi
+    log_info "Temporary Odoo ready (waited ${waited}s)."
+}
+
+_stop_temp_odoo() {
+    if [ -n "$_TMP_ODOO_PID" ]; then
+        log_info "Stopping temporary Odoo (PID ${_TMP_ODOO_PID})..."
+        kill "$_TMP_ODOO_PID" 2>/dev/null || true
+        wait "$_TMP_ODOO_PID" 2>/dev/null || true
+        _TMP_ODOO_PID=""
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Step 6: Database Initialization via XML-RPC
+# Creates DB with full control: login, password, language, country, demo, phone
+# Then installs extra modules if specified
+# Supports INIT_* environment variables + legacy INITDB_OPTIONS fallback
 # -----------------------------------------------------------------------------
 initialize_database() {
-    local initdb_options="${INITDB_OPTIONS:-}"
+    local init_db="${INIT_DB:-}"
+    local init_modules="${INIT_MODULES:-}"
+    local init_login="${INIT_LOGIN:-admin}"
+    local init_password="${INIT_PASSWORD:-admin}"
+    local init_lang="${INIT_LANG:-en_US}"
+    local init_country="${INIT_COUNTRY:-}"
+    local init_phone="${INIT_PHONE:-}"
+    local init_demo="${INIT_DEMO:-FALSE}"
+    init_demo="${init_demo^^}"
 
-    if [ -z "$initdb_options" ]; then
-        log_info "INITDB_OPTIONS not set, skipping database initialization."
+    # Legacy fallback: if INIT_DB is empty but INITDB_OPTIONS is set, use click-odoo-initdb
+    local initdb_options="${INITDB_OPTIONS:-}"
+    if [ -z "$init_db" ] && [ -n "$initdb_options" ]; then
+        log_info "Legacy mode: Running click-odoo-initdb with options: ${initdb_options}..."
+        if gosu odoo click-odoo-initdb -c "$ERP_CONF_PATH" $initdb_options; then
+            log_info "Database initialization completed successfully."
+        else
+            local exit_code=$?
+            log_warn "click-odoo-initdb exited with code ${exit_code}. This may be normal if the database already exists."
+        fi
         return 0
     fi
 
-    log_info "Running click-odoo-initdb with options: ${initdb_options}..."
-
-    if gosu odoo click-odoo-initdb -c "$ERP_CONF_PATH" $initdb_options; then
-        log_info "Database initialization completed successfully."
-    else
-        local exit_code=$?
-        log_warn "click-odoo-initdb exited with code ${exit_code}. This may be normal if the database already exists."
+    if [ -z "$init_db" ]; then
+        log_info "INIT_DB not set, skipping database initialization."
+        return 0
     fi
+
+    local odoo_port="${ODOO_PORT:-8069}"
+    local admin_passwd
+    admin_passwd=$(printenv 'conf.admin_passwd' || echo 'admin')
+
+    # Check if DB already exists
+    local db_host db_port db_user db_password
+    db_host=$(printenv 'conf.db_host' || echo 'db')
+    db_port=$(printenv 'conf.db_port' || echo '5432')
+    db_user=$(printenv 'conf.db_user' || echo 'odoo')
+    db_password=$(printenv 'conf.db_password' || echo 'odoo')
+
+    local db_exists
+    db_exists=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
+        "SELECT 1 FROM pg_database WHERE datname = '${init_db}';" 2>/dev/null | xargs)
+
+    # Use a dedicated temp port so it doesn't conflict with the main Odoo startup later
+    local tmp_port=8099
+
+    if [ "$db_exists" = "1" ]; then
+        log_info "Database '${init_db}' already exists, skipping creation."
+        # Still install modules if requested on existing DB
+        if [ -n "$init_modules" ]; then
+            _start_temp_odoo "$tmp_port"
+            _xmlrpc_install_modules "$tmp_port" "$init_db" "$init_login" "$init_password" "$init_modules"
+            _stop_temp_odoo
+        fi
+        return 0
+    fi
+
+    log_info "Creating database '${init_db}' via XML-RPC..."
+    log_info "  Login: ${init_login}, Lang: ${init_lang}, Country: ${init_country:-auto}, Demo: ${init_demo}"
+    _start_temp_odoo "$tmp_port" || return 1
+
+    # Convert demo flag to Python boolean
+    local demo_flag="False"
+    if [ "$init_demo" = "TRUE" ]; then
+        demo_flag="True"
+    fi
+
+    # Create database via XML-RPC /xmlrpc/2/db create_database
+    local create_result
+    create_result=$(python3 -c "
+import xmlrpc.client
+import sys
+
+proxy = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/db')
+try:
+    result = proxy.create_database(
+        '${admin_passwd}',
+        '${init_db}',
+        ${demo_flag},
+        '${init_lang}',
+        '${init_password}',
+        '${init_login}',
+        '${init_country}'
+    )
+    print('OK')
+except xmlrpc.client.Fault as e:
+    print(f'FAULT:{e.faultString}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'ERROR:{e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1) || true
+
+    if echo "$create_result" | grep -q "^OK"; then
+        log_info "Database '${init_db}' created successfully."
+    else
+        log_error "Failed to create database: ${create_result}"
+        _stop_temp_odoo
+        return 1
+    fi
+
+    # Set phone number if provided (via object endpoint)
+    if [ -n "$init_phone" ]; then
+        log_info "Setting phone number for admin user..."
+        python3 -c "
+import xmlrpc.client
+
+class OdooTransport(xmlrpc.client.Transport):
+    def __init__(self, db_name):
+        super().__init__()
+        self._db = db_name
+    def send_headers(self, connection, headers):
+        super().send_headers(connection, headers)
+        connection.putheader('X-Odoo-Database', self._db)
+
+transport = OdooTransport('${init_db}')
+common = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/common', transport=transport)
+uid = common.authenticate('${init_db}', '${init_login}', '${init_password}', {})
+models = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/object', transport=transport)
+partner_ids = models.execute_kw('${init_db}', uid, '${init_password}',
+    'res.users', 'read', [[uid], ['partner_id']])
+if partner_ids:
+    partner_id = partner_ids[0]['partner_id'][0]
+    models.execute_kw('${init_db}', uid, '${init_password}',
+        'res.partner', 'write', [[partner_id], {'phone': '${init_phone}'}])
+    print('Phone set successfully.')
+" 2>&1 && log_info "Phone number set." || log_warn "Could not set phone number."
+    fi
+
+    # Install extra modules if specified
+    if [ -n "$init_modules" ]; then
+        _xmlrpc_install_modules "$tmp_port" "$init_db" "$init_login" "$init_password" "$init_modules"
+    fi
+
+    # Stop temporary Odoo
+    _stop_temp_odoo
+    log_info "Database initialization complete."
+}
+
+# Helper: Install modules via XML-RPC on a running Odoo
+_xmlrpc_install_modules() {
+    local port="$1" db="$2" login="$3" password="$4" modules="$5"
+
+    log_info "Installing modules: ${modules}..."
+    python3 -c "
+import xmlrpc.client, sys, time
+
+class OdooTransport(xmlrpc.client.Transport):
+    def __init__(self, db_name):
+        super().__init__()
+        self._db = db_name
+    def send_headers(self, connection, headers):
+        super().send_headers(connection, headers)
+        connection.putheader('X-Odoo-Database', self._db)
+
+port, db, login, password = '${port}', '${db}', '${login}', '${password}'
+modules = [m.strip() for m in '${modules}'.split(',') if m.strip()]
+
+transport = OdooTransport(db)
+common = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/common', transport=transport)
+uid = common.authenticate(db, login, password, {})
+if not uid:
+    print('Authentication failed', file=sys.stderr)
+    sys.exit(1)
+
+models = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/object', transport=transport)
+
+# Update module list first
+models.execute_kw(db, uid, password, 'ir.module.module', 'update_list', [])
+
+for mod in modules:
+    # Find module
+    mod_ids = models.execute_kw(db, uid, password,
+        'ir.module.module', 'search', [[('name', '=', mod)]])
+    if not mod_ids:
+        print(f'Module {mod} not found, skipping.', file=sys.stderr)
+        continue
+
+    # Check state
+    mod_data = models.execute_kw(db, uid, password,
+        'ir.module.module', 'read', [mod_ids, ['state']])
+    state = mod_data[0]['state']
+
+    if state == 'installed':
+        print(f'Module {mod} already installed.')
+        continue
+
+    # Install
+    print(f'Installing {mod}...')
+    models.execute_kw(db, uid, password,
+        'ir.module.module', 'button_immediate_install', [mod_ids])
+    print(f'Module {mod} installed.')
+
+print('All modules processed.')
+" 2>&1 | while IFS= read -r line; do log_info "  $line"; done
 }
 
 # -----------------------------------------------------------------------------
@@ -747,7 +987,7 @@ main() {
     # Step 5: Install NPM packages
     install_npm_packages
 
-    # Step 6: Initialize database if INITDB_OPTIONS is set
+    # Step 6: Initialize database if INIT_DB or INITDB_OPTIONS is set
     set_state "INITIALIZING"
     initialize_database
 
