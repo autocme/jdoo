@@ -46,6 +46,17 @@ log_error() {
     echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
 }
 
+# Validate package name (pip/npm) — reject anything that could be shell/code injection
+validate_package_name() {
+    local pkg="$1"
+    # Allow: letters, digits, hyphen, underscore, dot, brackets (extras), version specs (==, >=, <=, ~=, !=)
+    if [[ ! "$pkg" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*(\[.*\])?(([=><!~]+)[a-zA-Z0-9.*,]+)?$ ]]; then
+        log_error "Invalid package name rejected: ${pkg}"
+        return 1
+    fi
+    return 0
+}
+
 # -----------------------------------------------------------------------------
 # Step 1: Handle PUID/PGID - Adjust odoo user/group to match requested IDs
 # -----------------------------------------------------------------------------
@@ -65,8 +76,15 @@ setup_user_permissions() {
         usermod -o -u "$PUID" odoo
     fi
 
-    log_info "Fixing ownership of Odoo directories..."
-    chown -R odoo:odoo "$ODOO_DATA_DIR" || true
+    # Only run expensive chown -R on data dir if ownership doesn't match
+    # (avoids slow recursive scan on large filestores with thousands of files)
+    if [ "$(stat -c '%u:%g' "$ODOO_DATA_DIR" 2>/dev/null)" != "${PUID}:${PGID}" ]; then
+        log_info "Fixing ownership of Odoo directories (PUID/PGID changed)..."
+        chown -R odoo:odoo "$ODOO_DATA_DIR" || true
+    else
+        log_info "Data directory ownership already correct, skipping recursive chown."
+    fi
+    # Config and extra-addons are small — always fix
     chown -R odoo:odoo /etc/odoo || true
     chown -R odoo:odoo /mnt/extra-addons 2>/dev/null || true
 
@@ -406,6 +424,11 @@ install_python_packages() {
             continue
         fi
 
+        if ! validate_package_name "$pkg"; then
+            log_warn "Skipping invalid Python package name: $pkg"
+            continue
+        fi
+
         if [[ "$pkg" == *"=="* ]]; then
             local pkg_name="${pkg%%==*}"
             local pkg_version="${pkg#*==}"
@@ -468,6 +491,11 @@ install_npm_packages() {
             continue
         fi
 
+        if ! validate_package_name "$pkg"; then
+            log_warn "Skipping invalid NPM package name: $pkg"
+            continue
+        fi
+
         if npm list -g "$pkg" --depth=0 &>/dev/null; then
             local installed_version
             installed_version=$(npm list -g "$pkg" --depth=0 2>/dev/null | grep "$pkg" | sed -n 's/.*@\([0-9.]*\).*/\1/p')
@@ -483,10 +511,14 @@ install_npm_packages() {
 
         local packages="${npm_install//,/ }"
 
-        if npm install -g --fund=false --loglevel=warn $packages 2>&1 | grep -v "^npm warn"; then
+        local npm_output npm_exit=0
+        npm_output=$(npm install -g --fund=false --loglevel=warn $packages 2>&1) || npm_exit=$?
+        # Filter npm warnings from output display
+        echo "$npm_output" | grep -v "^npm warn" || true
+        if [ "$npm_exit" -eq 0 ]; then
             log_info "NPM packages installed successfully."
         else
-            log_error "Failed to install NPM packages!"
+            log_error "Failed to install NPM packages! (exit code: ${npm_exit})"
             return 1
         fi
     else
@@ -584,8 +616,9 @@ initialize_database() {
     db_password=$(printenv 'conf.db_password' || echo 'odoo')
 
     local db_exists
-    db_exists=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
-        "SELECT 1 FROM pg_database WHERE datname = '${init_db}';" 2>/dev/null | xargs)
+    db_exists=$(echo "SELECT 1 FROM pg_database WHERE datname = :'dbname';" | \
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres \
+        -v "dbname=${init_db}" -tA 2>/dev/null | xargs)
 
     # Use a dedicated temp port so it doesn't conflict with the main Odoo startup later
     local tmp_port=8099
@@ -612,22 +645,32 @@ initialize_database() {
     fi
 
     # Create database via XML-RPC /xmlrpc/2/db create_database
+    # Variables passed via environment to prevent shell/code injection
     local create_result
-    create_result=$(python3 -c "
-import xmlrpc.client
-import sys
+    create_result=$(
+        _XMLRPC_PORT="$tmp_port" \
+        _XMLRPC_ADMIN_PASSWD="$admin_passwd" \
+        _XMLRPC_DB="$init_db" \
+        _XMLRPC_DEMO="$demo_flag" \
+        _XMLRPC_LANG="$init_lang" \
+        _XMLRPC_PASSWORD="$init_password" \
+        _XMLRPC_LOGIN="$init_login" \
+        _XMLRPC_COUNTRY="$init_country" \
+        python3 -c "
+import xmlrpc.client, os, sys
 
-proxy = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/db')
+port = os.environ['_XMLRPC_PORT']
+admin_passwd = os.environ['_XMLRPC_ADMIN_PASSWD']
+db_name = os.environ['_XMLRPC_DB']
+demo = os.environ['_XMLRPC_DEMO'] == 'True'
+lang = os.environ['_XMLRPC_LANG']
+password = os.environ['_XMLRPC_PASSWORD']
+login = os.environ['_XMLRPC_LOGIN']
+country = os.environ['_XMLRPC_COUNTRY']
+
+proxy = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/db')
 try:
-    result = proxy.create_database(
-        '${admin_passwd}',
-        '${init_db}',
-        ${demo_flag},
-        '${init_lang}',
-        '${init_password}',
-        '${init_login}',
-        '${init_country}'
-    )
+    result = proxy.create_database(admin_passwd, db_name, demo, lang, password, login, country)
     print('OK')
 except xmlrpc.client.Fault as e:
     print(f'FAULT:{e.faultString}', file=sys.stderr)
@@ -646,10 +689,22 @@ except Exception as e:
     fi
 
     # Set phone number if provided (via object endpoint)
+    # Variables passed via environment to prevent shell/code injection
     if [ -n "$init_phone" ]; then
         log_info "Setting phone number for admin user..."
+        _XMLRPC_PORT="$tmp_port" \
+        _XMLRPC_DB="$init_db" \
+        _XMLRPC_LOGIN="$init_login" \
+        _XMLRPC_PASSWORD="$init_password" \
+        _XMLRPC_PHONE="$init_phone" \
         python3 -c "
-import xmlrpc.client
+import xmlrpc.client, os
+
+port = os.environ['_XMLRPC_PORT']
+db = os.environ['_XMLRPC_DB']
+login = os.environ['_XMLRPC_LOGIN']
+password = os.environ['_XMLRPC_PASSWORD']
+phone = os.environ['_XMLRPC_PHONE']
 
 class OdooTransport(xmlrpc.client.Transport):
     def __init__(self, db_name):
@@ -659,16 +714,16 @@ class OdooTransport(xmlrpc.client.Transport):
         super().send_headers(connection, headers)
         connection.putheader('X-Odoo-Database', self._db)
 
-transport = OdooTransport('${init_db}')
-common = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/common', transport=transport)
-uid = common.authenticate('${init_db}', '${init_login}', '${init_password}', {})
-models = xmlrpc.client.ServerProxy('http://localhost:${tmp_port}/xmlrpc/2/object', transport=transport)
-partner_ids = models.execute_kw('${init_db}', uid, '${init_password}',
+transport = OdooTransport(db)
+common = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/common', transport=transport)
+uid = common.authenticate(db, login, password, {})
+models = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/object', transport=transport)
+partner_ids = models.execute_kw(db, uid, password,
     'res.users', 'read', [[uid], ['partner_id']])
 if partner_ids:
     partner_id = partner_ids[0]['partner_id'][0]
-    models.execute_kw('${init_db}', uid, '${init_password}',
-        'res.partner', 'write', [[partner_id], {'phone': '${init_phone}'}])
+    models.execute_kw(db, uid, password,
+        'res.partner', 'write', [[partner_id], {'phone': phone}])
     print('Phone set successfully.')
 " 2>&1 && log_info "Phone number set." || log_warn "Could not set phone number."
     fi
@@ -688,8 +743,20 @@ _xmlrpc_install_modules() {
     local port="$1" db="$2" login="$3" password="$4" modules="$5"
 
     log_info "Installing modules: ${modules}..."
+    # Variables passed via environment to prevent shell/code injection
+    _XMLRPC_PORT="$port" \
+    _XMLRPC_DB="$db" \
+    _XMLRPC_LOGIN="$login" \
+    _XMLRPC_PASSWORD="$password" \
+    _XMLRPC_MODULES="$modules" \
     python3 -c "
-import xmlrpc.client, sys, time
+import xmlrpc.client, os, sys
+
+port = os.environ['_XMLRPC_PORT']
+db = os.environ['_XMLRPC_DB']
+login = os.environ['_XMLRPC_LOGIN']
+password = os.environ['_XMLRPC_PASSWORD']
+modules = [m.strip() for m in os.environ['_XMLRPC_MODULES'].split(',') if m.strip()]
 
 class OdooTransport(xmlrpc.client.Transport):
     def __init__(self, db_name):
@@ -698,9 +765,6 @@ class OdooTransport(xmlrpc.client.Transport):
     def send_headers(self, connection, headers):
         super().send_headers(connection, headers)
         connection.putheader('X-Odoo-Database', self._db)
-
-port, db, login, password = '${port}', '${db}', '${login}', '${password}'
-modules = [m.strip() for m in '${modules}'.split(',') if m.strip()]
 
 transport = OdooTransport(db)
 common = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/common', transport=transport)
@@ -852,10 +916,11 @@ fix_report_url() {
     fi
 
     for db_name in $db_list; do
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c \
-            "INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
-             VALUES ('report.url', '${report_url}', 1, 1, now(), now())
-             ON CONFLICT (key) DO UPDATE SET value = '${report_url}', write_date = now();" \
+        echo "INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
+             VALUES ('report.url', :'report_url', 1, 1, now(), now())
+             ON CONFLICT (key) DO UPDATE SET value = :'report_url', write_date = now();" | \
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+            -v "report_url=${report_url}" \
             2>/dev/null && \
         log_info "  report.url = ${report_url} -> ${db_name}" || \
         log_warn "  Could not set report.url for ${db_name} (new database?)"
@@ -954,6 +1019,28 @@ start_odoo() {
 }
 
 # -----------------------------------------------------------------------------
+# Log Rotation: rotate Odoo log file at startup if it exceeds threshold
+# Keeps last 3 rotated copies (.1, .2, .3). Size configurable via LOG_ROTATE_SIZE.
+# -----------------------------------------------------------------------------
+rotate_logs() {
+    local logfile
+    logfile=$(grep "^logfile" "$ERP_CONF_PATH" 2>/dev/null | sed 's/^logfile *= *//' | xargs)
+    if [ -z "$logfile" ] || [ ! -f "$logfile" ]; then
+        return 0
+    fi
+    local size
+    size=$(stat -c '%s' "$logfile" 2>/dev/null || echo 0)
+    local max_size=${LOG_ROTATE_SIZE:-52428800}  # 50MB default
+    if [ "$size" -gt "$max_size" ]; then
+        rm -f "${logfile}.3"
+        [ -f "${logfile}.2" ] && mv "${logfile}.2" "${logfile}.3"
+        [ -f "${logfile}.1" ] && mv "${logfile}.1" "${logfile}.2"
+        mv "$logfile" "${logfile}.1"
+        log_info "Rotated log file ($(( size / 1024 / 1024 ))MB → ${logfile}.1)"
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Main Entrypoint Logic
 # -----------------------------------------------------------------------------
 main() {
@@ -980,6 +1067,9 @@ main() {
 
     # Apply computed resources to erp.conf (after config generation)
     apply_resources
+
+    # Rotate logs before starting (prevents unbounded log growth)
+    rotate_logs
 
     # Step 4: Install Python packages
     install_python_packages

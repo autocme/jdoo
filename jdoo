@@ -13,12 +13,9 @@
 #   PG_VERSION           15->14, 16->15, 17-18->16, 19+->17
 #   COMPOSE_PROJECT_NAME jdoo + major (15.0 -> jdoo15)
 #
-# Auto-computed from host RAM (override any in .env):
-#   PG_SHARED_BUFFERS       min(25% RAM, 4GB)
-#   PG_EFFECTIVE_CACHE_SIZE 50% RAM
-#   PG_WORK_MEM             64MB default
-#   PG_MAINTENANCE_WORK_MEM min(10% RAM, 2GB)
-#   PG_MAX_CONNECTIONS      100
+# PG tuning is handled inside the container by pg-auto-tune.sh
+# (auto-computes from container RAM, respects Docker --memory limits).
+# Override via .env: PG_SHARED_BUFFERS, PG_EFFECTIVE_CACHE_SIZE, etc.
 # =============================================================================
 
 set -euo pipefail
@@ -58,59 +55,11 @@ if [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
     export COMPOSE_PROJECT_NAME="jdoo${MAJOR}"
 fi
 
-# --- Auto-compute PostgreSQL tuning from host RAM ---
-get_host_ram_mb() {
-    local ram_kb
-    ram_kb=$(grep "^MemTotal:" /proc/meminfo 2>/dev/null | awk '{print $2}')
-    if [ -n "$ram_kb" ] && [ "$ram_kb" -gt 0 ] 2>/dev/null; then
-        echo $(( ram_kb / 1024 ))
-    else
-        echo 2048  # fallback 2GB
-    fi
-}
+# PG tuning is handled automatically inside the container by pg-auto-tune.sh
+# which reads cgroup-aware RAM (respects Docker --memory limits).
+# Override via .env: PG_SHARED_BUFFERS, PG_EFFECTIVE_CACHE_SIZE, etc.
 
-compute_pg_tuning() {
-    local ram_mb
-    ram_mb=$(get_host_ram_mb)
-
-    # PG_SHARED_BUFFERS: min(25% of RAM, 4096MB)
-    if [ -z "${PG_SHARED_BUFFERS:-}" ]; then
-        local sb=$(( ram_mb / 4 ))
-        [ "$sb" -gt 4096 ] && sb=4096
-        [ "$sb" -lt 128 ] && sb=128
-        export PG_SHARED_BUFFERS="${sb}MB"
-    fi
-
-    # PG_EFFECTIVE_CACHE_SIZE: 50% of RAM
-    if [ -z "${PG_EFFECTIVE_CACHE_SIZE:-}" ]; then
-        local ecs=$(( ram_mb / 2 ))
-        [ "$ecs" -lt 256 ] && ecs=256
-        export PG_EFFECTIVE_CACHE_SIZE="${ecs}MB"
-    fi
-
-    # PG_WORK_MEM: 64MB default
-    if [ -z "${PG_WORK_MEM:-}" ]; then
-        export PG_WORK_MEM="64MB"
-    fi
-
-    # PG_MAINTENANCE_WORK_MEM: min(10% of RAM, 2048MB)
-    if [ -z "${PG_MAINTENANCE_WORK_MEM:-}" ]; then
-        local mwm=$(( ram_mb / 10 ))
-        [ "$mwm" -gt 2048 ] && mwm=2048
-        [ "$mwm" -lt 64 ] && mwm=64
-        export PG_MAINTENANCE_WORK_MEM="${mwm}MB"
-    fi
-
-    # PG_MAX_CONNECTIONS: default 100
-    if [ -z "${PG_MAX_CONNECTIONS:-}" ]; then
-        export PG_MAX_CONNECTIONS="100"
-    fi
-}
-
-compute_pg_tuning
-
-echo "[jdoo] Odoo ${ODOO_VERSION} | Python ${PYTHON_VERSION} | PG ${PG_VERSION} | Port ${ODOO_PORT} | Project ${COMPOSE_PROJECT_NAME}"
-echo "[jdoo] PG: shared=${PG_SHARED_BUFFERS} | cache=${PG_EFFECTIVE_CACHE_SIZE} | work=${PG_WORK_MEM} | maint=${PG_MAINTENANCE_WORK_MEM} | conn=${PG_MAX_CONNECTIONS}"
+echo "[jdoo] Odoo ${ODOO_VERSION} | Python ${PYTHON_VERSION} | PG ${PG_VERSION} | Port ${ODOO_PORT:-8069} | Project ${COMPOSE_PROJECT_NAME}"
 
 # --- Build compose file list ---
 COMPOSE_FILES="-f docker-compose.yml"
