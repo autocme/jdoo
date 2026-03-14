@@ -238,9 +238,25 @@ compute_resources() {
         workers="$WORKERS"
         log_info "  Workers: ${workers} (from WORKERS env var)"
     else
-        workers=$(( cpu_count * 2 ))
+        # CPU-based: CPU * 2
+        local cpu_workers=$(( cpu_count * 2 ))
+
+        # RAM-based: each worker needs ~325MB (Odoo estimate)
+        # Reserve 512MB for OS/PG/cron/gevent, rest for HTTP workers
+        local ram_available_mb=$(( ram_mb - 512 ))
+        [ "$ram_available_mb" -lt 325 ] && ram_available_mb=325
+        local ram_workers=$(( ram_available_mb / 325 ))
+
+        # Use the LOWER of CPU-based and RAM-based (bottleneck wins)
+        if [ "$ram_workers" -lt "$cpu_workers" ]; then
+            workers=$ram_workers
+            log_info "  Workers: ${workers} (auto: RAM-limited, ${ram_mb}MB / 325MB per worker)"
+        else
+            workers=$cpu_workers
+            log_info "  Workers: ${workers} (auto: CPU*2)"
+        fi
+
         [ "$workers" -lt 2 ] && workers=2
-        log_info "  Workers: ${workers} (auto: CPU*2)"
     fi
 
     # --- Cron Threads ---

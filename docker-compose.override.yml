@@ -1,0 +1,6 @@
+# Local development overrides — auto-loaded by docker compose
+# Exposes nginx on ODOO_PORT (default 8069) for local access
+services:
+  nginx:
+    ports:
+      - "${ODOO_PORT:-8069}:8069"

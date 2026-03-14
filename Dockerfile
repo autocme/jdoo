@@ -119,6 +119,7 @@ ENV ODOO_VERSION=${ODOO_VERSION} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NODE_OPTIONS="--max-old-space-size=512" \
     PUID=1000 \
     PGID=1000 \
     AUTO_UPGRADE=FALSE \
@@ -220,6 +221,7 @@ RUN set -eux; \
     curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -; \
     apt-get install -y --no-install-recommends nodejs; \
     npm install -g npm@latest 2>&1 | grep -v "^npm warn"; \
+    npm install -g rtlcss less 2>&1 | grep -v "^npm warn"; \
     npm config set update-notifier false; \
     rm -rf /var/lib/apt/lists/*
 
