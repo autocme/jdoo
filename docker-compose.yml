@@ -60,7 +60,8 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-proxy
     restart: unless-stopped
     depends_on:
-      - odoo
+      odoo:
+        condition: service_healthy
     environment:
       ODOO_PORT: "8069"
     volumes:
@@ -175,6 +176,12 @@ services:
       PY_INSTALL: ${PY_INSTALL:-phonenumbers,python-stdnum,num2words}
       NPM_INSTALL: ${NPM_INSTALL:-rtlcss,less}
 
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      start_period: 600s
+      retries: 3
     networks:
       - internal
 

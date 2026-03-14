@@ -3,19 +3,20 @@
 # jdoo - Smart Healthcheck Script
 # =============================================================================
 # Reads container state from a file written by entrypoint.sh.
-# Returns healthy (exit 0) during startup/upgrade to prevent orchestrators
-# from killing the container. Only checks HTTP when Odoo is actually running.
+# Returns healthy (exit 0) ONLY when Odoo HTTP is actually responding.
+# Docker's start_period protects the container from being killed during init.
 #
 # States:
-#   STARTING         → exit 0 (entrypoint initializing)
-#   INITIALIZING     → exit 0 (database initialization in progress)
-#   UPGRADING        → exit 0 (module upgrade in progress)
-#   RUNNING          → exit 0 (Odoo HTTP responding)
-#   RUNNING_LOADING  → exit 0 (Odoo process alive, loading modules)
+#   STARTING         → exit 1 (entrypoint initializing — not ready)
+#   INITIALIZING     → exit 1 (database initialization in progress — not ready)
+#   UPGRADING        → exit 1 (module upgrade in progress — not ready)
+#   RUNNING          → exit 0 if HTTP responds, exit 1 if still loading
 #   RUNNING_NO_PROCESS → exit 1 (Odoo process not found — crashed)
-#   RUNNING_HTTP_FAIL  → exit 1 (Odoo process alive, HTTP not responding)
 #   UPGRADE_FAILED   → exit 1 (module upgrade failed)
 #   UNKNOWN          → exit 1 (state file missing or unrecognized)
+#
+# The start_period in docker-compose.yml (default 600s) ensures Docker
+# won't count these failures or restart the container during init.
 #
 # Usage (Dockerfile):
 #   HEALTHCHECK CMD /usr/local/bin/healthcheck.sh
@@ -32,7 +33,7 @@ STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "")
 case "$STATE" in
     STARTING|INITIALIZING|UPGRADING|UPGRADE_RETRY)
         echo "$STATE"
-        exit 0
+        exit 1
         ;;
     RUNNING)
         # Layer 1: Is the Odoo process alive?
@@ -57,7 +58,7 @@ case "$STATE" in
 
         # Process alive but HTTP not ready — still loading modules
         echo "RUNNING_LOADING"
-        exit 0
+        exit 1
         ;;
     UPGRADE_FAILED)
         echo "UPGRADE_FAILED"
