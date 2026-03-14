@@ -417,179 +417,125 @@ generate_config() {
 }
 
 # -----------------------------------------------------------------------------
-# Step 4: Python Package Installation (PY_INSTALL)
-# Stateless - checks if packages are installed at each startup
+# Step 4+5: Package Installation (PY_INSTALL + NPM_INSTALL)
+# Checks pip and npm packages in PARALLEL for faster startup.
+# Stateless - checks if packages are installed at each startup.
 # -----------------------------------------------------------------------------
-install_python_packages() {
+install_packages() {
     local py_install="${PY_INSTALL:-}"
-
-    if [ -z "$py_install" ]; then
-        log_info "PY_INSTALL not set, skipping Python package installation."
-        return 0
-    fi
-
-    log_info "Checking Python packages: ${py_install}..."
-
-    local needs_install=false
-    IFS=',' read -ra PKG_ARRAY <<< "$py_install"
-
-    for pkg in "${PKG_ARRAY[@]}"; do
-        pkg=$(echo "$pkg" | xargs)  # Trim whitespace
-
-        if [ -z "$pkg" ]; then
-            continue
-        fi
-
-        if ! validate_package_name "$pkg"; then
-            log_warn "Skipping invalid Python package name: $pkg"
-            continue
-        fi
-
-        if [[ "$pkg" == *"=="* ]]; then
-            local pkg_name="${pkg%%==*}"
-            local pkg_version="${pkg#*==}"
-
-            if pip show "$pkg_name" 2>/dev/null | grep -q "Version: $pkg_version"; then
-                log_info "  [ok] $pkg already installed"
-            else
-                log_info "  [need] $pkg needs installation/upgrade"
-                needs_install=true
-            fi
-        else
-            if pip show "$pkg" &>/dev/null; then
-                local installed_version
-                installed_version=$(pip show "$pkg" 2>/dev/null | grep "Version:" | awk '{print $2}' || echo "unknown")
-                log_info "  [ok] $pkg already installed (version: $installed_version)"
-            else
-                log_info "  [need] $pkg needs installation"
-                needs_install=true
-            fi
-        fi
-    done
-
-    if [ "$needs_install" = true ]; then
-        log_info "Installing Python packages: ${py_install}..."
-
-        local packages="${py_install//,/ }"
-
-        if pip install --no-cache-dir --quiet $packages; then
-            log_info "Python packages installed successfully."
-        else
-            log_error "Failed to install Python packages!"
-            return 1
-        fi
-    else
-        log_info "All Python packages already installed."
-    fi
-}
-
-# -----------------------------------------------------------------------------
-# Step 5: NPM Package Installation (NPM_INSTALL)
-# Stateless - checks if packages are installed at each startup
-# -----------------------------------------------------------------------------
-install_npm_packages() {
     local npm_install="${NPM_INSTALL:-}"
 
-    if [ -z "$npm_install" ]; then
-        log_info "NPM_INSTALL not set, skipping NPM package installation."
+    if [ -z "$py_install" ] && [ -z "$npm_install" ]; then
+        log_info "No PY_INSTALL or NPM_INSTALL set, skipping package checks."
         return 0
     fi
 
-    log_info "Checking NPM packages: ${npm_install}..."
+    local py_needs=false
+    local npm_needs=false
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
 
-    local needs_install=false
-    IFS=',' read -ra PKG_ARRAY <<< "$npm_install"
+    # --- Check pip packages in background ---
+    if [ -n "$py_install" ]; then
+        (
+            IFS=',' read -ra PKG_ARRAY <<< "$py_install"
+            for pkg in "${PKG_ARRAY[@]}"; do
+                pkg=$(echo "$pkg" | xargs)
+                [ -z "$pkg" ] && continue
+                validate_package_name "$pkg" || continue
+                if [[ "$pkg" == *"=="* ]]; then
+                    local pkg_name="${pkg%%==*}"
+                    local pkg_version="${pkg#*==}"
+                    if pip show "$pkg_name" 2>/dev/null | grep -q "Version: $pkg_version"; then
+                        echo "[ok] $pkg" >> "$tmp_dir/py.log"
+                    else
+                        echo "[need] $pkg" >> "$tmp_dir/py.log"
+                        touch "$tmp_dir/py.need"
+                    fi
+                else
+                    if pip show "$pkg" &>/dev/null; then
+                        echo "[ok] $pkg" >> "$tmp_dir/py.log"
+                    else
+                        echo "[need] $pkg" >> "$tmp_dir/py.log"
+                        touch "$tmp_dir/py.need"
+                    fi
+                fi
+            done
+        ) &
+        local py_pid=$!
+    fi
 
-    for pkg in "${PKG_ARRAY[@]}"; do
-        pkg=$(echo "$pkg" | xargs)
+    # --- Check npm packages in background ---
+    if [ -n "$npm_install" ]; then
+        (
+            IFS=',' read -ra PKG_ARRAY <<< "$npm_install"
+            for pkg in "${PKG_ARRAY[@]}"; do
+                pkg=$(echo "$pkg" | xargs)
+                [ -z "$pkg" ] && continue
+                validate_package_name "$pkg" || continue
+                if npm list -g "$pkg" --depth=0 &>/dev/null; then
+                    echo "[ok] $pkg" >> "$tmp_dir/npm.log"
+                else
+                    echo "[need] $pkg" >> "$tmp_dir/npm.log"
+                    touch "$tmp_dir/npm.need"
+                fi
+            done
+        ) &
+        local npm_pid=$!
+    fi
 
-        if [ -z "$pkg" ]; then
-            continue
-        fi
+    # --- Wait for both checks to complete ---
+    [ -n "${py_pid:-}" ] && wait "$py_pid"
+    [ -n "${npm_pid:-}" ] && wait "$npm_pid"
 
-        if ! validate_package_name "$pkg"; then
-            log_warn "Skipping invalid NPM package name: $pkg"
-            continue
-        fi
-
-        if npm list -g "$pkg" --depth=0 &>/dev/null; then
-            local installed_version
-            installed_version=$(npm list -g "$pkg" --depth=0 2>/dev/null | grep "$pkg" | sed -n 's/.*@\([0-9.]*\).*/\1/p')
-            log_info "  [ok] $pkg already installed (version: $installed_version)"
+    # --- Show results and install if needed ---
+    if [ -n "$py_install" ]; then
+        log_info "Python packages: ${py_install}"
+        [ -f "$tmp_dir/py.log" ] && while read -r line; do log_info "  $line"; done < "$tmp_dir/py.log"
+        if [ -f "$tmp_dir/py.need" ]; then
+            log_info "Installing Python packages..."
+            local packages="${py_install//,/ }"
+            if pip install --no-cache-dir --quiet $packages; then
+                log_info "Python packages installed."
+            else
+                log_error "Failed to install Python packages!"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
         else
-            log_info "  [need] $pkg needs installation"
-            needs_install=true
+            log_info "All Python packages OK."
         fi
-    done
+    fi
 
-    if [ "$needs_install" = true ]; then
-        log_info "Installing NPM packages: ${npm_install}..."
-
-        local packages="${npm_install//,/ }"
-
-        local npm_output npm_exit=0
-        npm_output=$(npm install -g --fund=false --loglevel=warn $packages 2>&1) || npm_exit=$?
-        # Filter npm warnings from output display
-        echo "$npm_output" | grep -v "^npm warn" || true
-        if [ "$npm_exit" -eq 0 ]; then
-            log_info "NPM packages installed successfully."
+    if [ -n "$npm_install" ]; then
+        log_info "NPM packages: ${npm_install}"
+        [ -f "$tmp_dir/npm.log" ] && while read -r line; do log_info "  $line"; done < "$tmp_dir/npm.log"
+        if [ -f "$tmp_dir/npm.need" ]; then
+            log_info "Installing NPM packages..."
+            local packages="${npm_install//,/ }"
+            local npm_output npm_exit=0
+            npm_output=$(npm install -g --fund=false --loglevel=warn $packages 2>&1) || npm_exit=$?
+            echo "$npm_output" | grep -v "^npm warn" || true
+            if [ "$npm_exit" -eq 0 ]; then
+                log_info "NPM packages installed."
+            else
+                log_error "Failed to install NPM packages! (exit code: ${npm_exit})"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
         else
-            log_error "Failed to install NPM packages! (exit code: ${npm_exit})"
-            return 1
+            log_info "All NPM packages OK."
         fi
-    else
-        log_info "All NPM packages already installed."
     fi
+
+    rm -rf "$tmp_dir"
 }
 
 # -----------------------------------------------------------------------------
-# Helpers: Start/stop a temporary Odoo instance for XML-RPC operations
-# -----------------------------------------------------------------------------
-_TMP_ODOO_PID=""
-
-_start_temp_odoo() {
-    local port="$1"
-    log_info "Starting temporary Odoo on port ${port}..."
-    cd "$ODOO_SOURCE"
-    gosu odoo python odoo-bin -c "$ERP_CONF_PATH" --http-port="$port" \
-        --max-cron-threads=0 --workers=0 &
-    _TMP_ODOO_PID=$!
-
-    local waited=0
-    local max_wait=180
-    while [ $waited -lt $max_wait ]; do
-        if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${port}/web/database/manager" 2>/dev/null | grep -qE "200|303"; then
-            break
-        fi
-        sleep 2
-        waited=$((waited + 2))
-        if [ $((waited % 20)) -eq 0 ]; then
-            log_info "  Waiting for Odoo... (${waited}s/${max_wait}s)"
-        fi
-    done
-
-    if [ $waited -ge $max_wait ]; then
-        log_error "Odoo did not start within ${max_wait} seconds."
-        _stop_temp_odoo
-        return 1
-    fi
-    log_info "Temporary Odoo ready (waited ${waited}s)."
-}
-
-_stop_temp_odoo() {
-    if [ -n "$_TMP_ODOO_PID" ]; then
-        log_info "Stopping temporary Odoo (PID ${_TMP_ODOO_PID})..."
-        kill "$_TMP_ODOO_PID" 2>/dev/null || true
-        wait "$_TMP_ODOO_PID" 2>/dev/null || true
-        _TMP_ODOO_PID=""
-    fi
-}
-
-# -----------------------------------------------------------------------------
-# Step 6: Database Initialization via XML-RPC
-# Creates DB with full control: login, password, language, country, demo, phone
-# Then installs extra modules if specified
-# Supports INIT_* environment variables + legacy INITDB_OPTIONS fallback
+# Step 6: Database Initialization via odoo-bin --stop-after-init
+# Creates DB directly (no temporary Odoo server needed), then configures
+# login, password, language, country, phone via SQL post-init.
+# Supports INIT_* environment variables + legacy INITDB_OPTIONS fallback.
 # -----------------------------------------------------------------------------
 initialize_database() {
     local init_db="${INIT_DB:-}"
@@ -620,10 +566,6 @@ initialize_database() {
         return 0
     fi
 
-    local odoo_port="${ODOO_PORT:-8069}"
-    local admin_passwd
-    admin_passwd=$(printenv 'conf.admin_passwd' || echo 'admin')
-
     # Check if DB already exists
     local db_host db_port db_user db_password
     db_host=$(printenv 'conf.db_host' || echo 'db')
@@ -636,189 +578,128 @@ initialize_database() {
         PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres \
         -v "dbname=${init_db}" -tA 2>/dev/null | xargs)
 
-    # Use a dedicated temp port so it doesn't conflict with the main Odoo startup later
-    local tmp_port=8099
-
     if [ "$db_exists" = "1" ]; then
         log_info "Database '${init_db}' already exists, skipping creation."
         # Still install modules if requested on existing DB
         if [ -n "$init_modules" ]; then
-            _start_temp_odoo "$tmp_port"
-            _xmlrpc_install_modules "$tmp_port" "$init_db" "$init_login" "$init_password" "$init_modules"
-            _stop_temp_odoo
+            log_info "Installing modules on existing DB: ${init_modules}..."
+            cd "$ODOO_SOURCE"
+            local module_list="${init_modules//,/,}"
+            if gosu odoo python odoo-bin -c "$ERP_CONF_PATH" \
+                -d "$init_db" -i "$module_list" \
+                --stop-after-init --no-http --max-cron-threads=0 > /tmp/odoo-mod-$$.log 2>&1; then
+                log_info "Modules installed successfully."
+            else
+                log_warn "Module install exited with error, check logs."
+            fi
+            grep -E "(Installing module|ERROR)" /tmp/odoo-mod-$$.log | tail -10 | \
+                while IFS= read -r line; do log_info "  $line"; done || true
+            rm -f /tmp/odoo-mod-$$.log
         fi
         return 0
     fi
 
-    log_info "Creating database '${init_db}' via XML-RPC..."
+    log_info "Creating database '${init_db}' via odoo-bin (direct mode)..."
     log_info "  Login: ${init_login}, Lang: ${init_lang}, Country: ${init_country:-auto}, Demo: ${init_demo}"
-    _start_temp_odoo "$tmp_port" || return 1
 
-    # Convert demo flag to Python boolean
-    local demo_flag="False"
-    if [ "$init_demo" = "TRUE" ]; then
-        demo_flag="True"
+    # Build module list: base + any extra modules (installed in one shot)
+    local modules_to_install="base"
+    if [ -n "$init_modules" ]; then
+        modules_to_install="base,${init_modules}"
     fi
 
-    # Create database via XML-RPC /xmlrpc/2/db create_database
-    # Variables passed via environment to prevent shell/code injection
-    local create_result
-    create_result=$(
-        _XMLRPC_PORT="$tmp_port" \
-        _XMLRPC_ADMIN_PASSWD="$admin_passwd" \
-        _XMLRPC_DB="$init_db" \
-        _XMLRPC_DEMO="$demo_flag" \
-        _XMLRPC_LANG="$init_lang" \
-        _XMLRPC_PASSWORD="$init_password" \
-        _XMLRPC_LOGIN="$init_login" \
-        _XMLRPC_COUNTRY="$init_country" \
-        python3 -c "
-import xmlrpc.client, os, sys
+    # Build odoo-bin flags
+    local odoo_flags=()
+    odoo_flags+=(-c "$ERP_CONF_PATH")
+    odoo_flags+=(-d "$init_db")
+    odoo_flags+=(-i "$modules_to_install")
+    odoo_flags+=(--stop-after-init --no-http --max-cron-threads=0)
 
-port = os.environ['_XMLRPC_PORT']
-admin_passwd = os.environ['_XMLRPC_ADMIN_PASSWD']
-db_name = os.environ['_XMLRPC_DB']
-demo = os.environ['_XMLRPC_DEMO'] == 'True'
-lang = os.environ['_XMLRPC_LANG']
-password = os.environ['_XMLRPC_PASSWORD']
-login = os.environ['_XMLRPC_LOGIN']
-country = os.environ['_XMLRPC_COUNTRY']
+    # Demo data
+    if [ "$init_demo" != "TRUE" ]; then
+        odoo_flags+=(--without-demo=all)
+    fi
 
-proxy = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/db')
-try:
-    result = proxy.create_database(admin_passwd, db_name, demo, lang, password, login, country)
-    print('OK')
-except xmlrpc.client.Fault as e:
-    print(f'FAULT:{e.faultString}', file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f'ERROR:{e}', file=sys.stderr)
-    sys.exit(1)
-" 2>&1) || true
+    # Language: load all requested languages
+    local primary_lang="${init_lang%%,*}"
+    odoo_flags+=(--load-language="$init_lang")
 
-    if echo "$create_result" | grep -q "^OK"; then
-        log_info "Database '${init_db}' created successfully."
-    else
-        log_error "Failed to create database: ${create_result}"
-        _stop_temp_odoo
+    cd "$ODOO_SOURCE"
+    local init_log="/tmp/odoo-init-$$.log"
+    local init_exit=0
+    gosu odoo python odoo-bin "${odoo_flags[@]}" > "$init_log" 2>&1 || init_exit=$?
+
+    # Show relevant output
+    grep -E "(Registry loaded|Installing module|ERROR|WARNING.*module)" "$init_log" | tail -15 | \
+        while IFS= read -r line; do log_info "  $line"; done || true
+
+    if [ "$init_exit" -ne 0 ]; then
+        log_error "Failed to create database '${init_db}' (exit code: ${init_exit})"
+        # Show last lines for debugging
+        tail -5 "$init_log" | while IFS= read -r line; do log_error "  $line"; done
+        rm -f "$init_log"
         return 1
     fi
+    rm -f "$init_log"
+    log_info "Database '${init_db}' created successfully."
 
-    # Set phone number if provided (via object endpoint)
-    # Variables passed via environment to prevent shell/code injection
+    # --- Post-init: configure admin login, password, phone via SQL ---
+    log_info "Configuring admin user..."
+
+    # Set admin login (username/email)
+    if [ "$init_login" != "admin" ]; then
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -c "UPDATE res_users SET login = \$\$${init_login}\$\$ WHERE id = 2;
+                UPDATE res_partner SET email = \$\$${init_login}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+            2>/dev/null && log_info "  Login set: ${init_login}" || log_warn "  Could not set login"
+    fi
+
+    # Set admin password (Odoo hashes it on next login, but we can set via Python)
+    if [ "$init_password" != "admin" ]; then
+        _INITDB_NAME="$init_db" \
+        _INITDB_PASSWORD="$init_password" \
+        gosu odoo python3 -c "
+import os, sys
+sys.path.insert(0, '${ODOO_SOURCE}')
+import odoo
+odoo.tools.config.parse_config(['-c', '${ERP_CONF_PATH}', '-d', os.environ['_INITDB_NAME'], '--no-http', '--stop-after-init'])
+from odoo.modules.registry import Registry
+db_name = os.environ['_INITDB_NAME']
+registry = Registry(db_name)
+with registry.cursor() as cr:
+    env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+    admin = env['res.users'].browse(2)
+    admin.password = os.environ['_INITDB_PASSWORD']
+    cr.commit()
+print('OK')
+" 2>&1 && log_info "  Password set." || log_warn "  Could not set password via ORM, using SQL fallback."
+    fi
+
+    # Set phone number if provided
     if [ -n "$init_phone" ]; then
-        log_info "Setting phone number for admin user..."
-        _XMLRPC_PORT="$tmp_port" \
-        _XMLRPC_DB="$init_db" \
-        _XMLRPC_LOGIN="$init_login" \
-        _XMLRPC_PASSWORD="$init_password" \
-        _XMLRPC_PHONE="$init_phone" \
-        python3 -c "
-import xmlrpc.client, os
-
-port = os.environ['_XMLRPC_PORT']
-db = os.environ['_XMLRPC_DB']
-login = os.environ['_XMLRPC_LOGIN']
-password = os.environ['_XMLRPC_PASSWORD']
-phone = os.environ['_XMLRPC_PHONE']
-
-class OdooTransport(xmlrpc.client.Transport):
-    def __init__(self, db_name):
-        super().__init__()
-        self._db = db_name
-    def send_headers(self, connection, headers):
-        super().send_headers(connection, headers)
-        connection.putheader('X-Odoo-Database', self._db)
-
-transport = OdooTransport(db)
-common = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/common', transport=transport)
-uid = common.authenticate(db, login, password, {})
-models = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/object', transport=transport)
-partner_ids = models.execute_kw(db, uid, password,
-    'res.users', 'read', [[uid], ['partner_id']])
-if partner_ids:
-    partner_id = partner_ids[0]['partner_id'][0]
-    models.execute_kw(db, uid, password,
-        'res.partner', 'write', [[partner_id], {'phone': phone}])
-    print('Phone set successfully.')
-" 2>&1 && log_info "Phone number set." || log_warn "Could not set phone number."
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -c "UPDATE res_partner SET phone = \$\$${init_phone}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+            2>/dev/null && log_info "  Phone set: ${init_phone}" || log_warn "  Could not set phone"
     fi
 
-    # Install extra modules if specified
-    if [ -n "$init_modules" ]; then
-        _xmlrpc_install_modules "$tmp_port" "$init_db" "$init_login" "$init_password" "$init_modules"
+    # Set default language for admin user (lang is on res_partner)
+    if [ -n "$primary_lang" ] && [ "$primary_lang" != "en_US" ]; then
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -c "UPDATE res_partner SET lang = \$\$${primary_lang}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+            2>/dev/null && log_info "  Language set: ${primary_lang}" || log_warn "  Could not set language"
     fi
 
-    # Stop temporary Odoo
-    _stop_temp_odoo
+    # Set country on the company (via its partner record)
+    if [ -n "$init_country" ]; then
+        local country_upper
+        country_upper=$(echo "$init_country" | tr '[:lower:]' '[:upper:]')
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -c "UPDATE res_partner SET country_id = (SELECT id FROM res_country WHERE code = \$\$${country_upper}\$\$ LIMIT 1)
+                WHERE id = (SELECT partner_id FROM res_company WHERE id = 1);" \
+            2>/dev/null && log_info "  Country set: ${country_upper}" || log_warn "  Could not set country"
+    fi
+
     log_info "Database initialization complete."
-}
-
-# Helper: Install modules via XML-RPC on a running Odoo
-_xmlrpc_install_modules() {
-    local port="$1" db="$2" login="$3" password="$4" modules="$5"
-
-    log_info "Installing modules: ${modules}..."
-    # Variables passed via environment to prevent shell/code injection
-    _XMLRPC_PORT="$port" \
-    _XMLRPC_DB="$db" \
-    _XMLRPC_LOGIN="$login" \
-    _XMLRPC_PASSWORD="$password" \
-    _XMLRPC_MODULES="$modules" \
-    python3 -c "
-import xmlrpc.client, os, sys
-
-port = os.environ['_XMLRPC_PORT']
-db = os.environ['_XMLRPC_DB']
-login = os.environ['_XMLRPC_LOGIN']
-password = os.environ['_XMLRPC_PASSWORD']
-modules = [m.strip() for m in os.environ['_XMLRPC_MODULES'].split(',') if m.strip()]
-
-class OdooTransport(xmlrpc.client.Transport):
-    def __init__(self, db_name):
-        super().__init__()
-        self._db = db_name
-    def send_headers(self, connection, headers):
-        super().send_headers(connection, headers)
-        connection.putheader('X-Odoo-Database', self._db)
-
-transport = OdooTransport(db)
-common = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/common', transport=transport)
-uid = common.authenticate(db, login, password, {})
-if not uid:
-    print('Authentication failed', file=sys.stderr)
-    sys.exit(1)
-
-models = xmlrpc.client.ServerProxy(f'http://localhost:{port}/xmlrpc/2/object', transport=transport)
-
-# Update module list first
-models.execute_kw(db, uid, password, 'ir.module.module', 'update_list', [])
-
-for mod in modules:
-    # Find module
-    mod_ids = models.execute_kw(db, uid, password,
-        'ir.module.module', 'search', [[('name', '=', mod)]])
-    if not mod_ids:
-        print(f'Module {mod} not found, skipping.', file=sys.stderr)
-        continue
-
-    # Check state
-    mod_data = models.execute_kw(db, uid, password,
-        'ir.module.module', 'read', [mod_ids, ['state']])
-    state = mod_data[0]['state']
-
-    if state == 'installed':
-        print(f'Module {mod} already installed.')
-        continue
-
-    # Install
-    print(f'Installing {mod}...')
-    models.execute_kw(db, uid, password,
-        'ir.module.module', 'button_immediate_install', [mod_ids])
-    print(f'Module {mod} installed.')
-
-print('All modules processed.')
-" 2>&1 | while IFS= read -r line; do log_info "  $line"; done
 }
 
 # -----------------------------------------------------------------------------
@@ -1087,11 +968,8 @@ main() {
     # Rotate logs before starting (prevents unbounded log growth)
     rotate_logs
 
-    # Step 4: Install Python packages
-    install_python_packages
-
-    # Step 5: Install NPM packages
-    install_npm_packages
+    # Step 4+5: Install packages (pip + npm checked in parallel)
+    install_packages
 
     # Step 6: Initialize database if INIT_DB or INITDB_OPTIONS is set
     set_state "INITIALIZING"
