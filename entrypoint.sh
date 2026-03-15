@@ -654,8 +654,16 @@ initialize_database() {
             2>/dev/null && log_info "  Login set: ${init_login}" || log_warn "  Could not set login"
     fi
 
-    # Set admin password (Odoo hashes it on next login, but we can set via Python)
-    if [ "$init_password" != "admin" ]; then
+    # Set admin password
+    local init_password_hash="${INIT_PASSWORD_HASH:-}"
+    if [ -n "$init_password_hash" ]; then
+        # Direct hash injection — the hash (pbkdf2-sha512) was copied from the
+        # SaaS portal DB so the client can log in with the same password.
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -c "UPDATE res_users SET password = \$\$${init_password_hash}\$\$ WHERE id = 2;" \
+            2>/dev/null && log_info "  Password hash set." || log_warn "  Could not set password hash"
+    elif [ "$init_password" != "admin" ]; then
+        # Fallback: set plain-text password via ORM (Odoo hashes it)
         _INITDB_NAME="$init_db" \
         _INITDB_PASSWORD="$init_password" \
         gosu odoo python3 -c "
