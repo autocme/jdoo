@@ -167,6 +167,7 @@ services:
       INIT_PHONE: ${INIT_PHONE:-}
       INIT_DEMO: ${INIT_DEMO:-FALSE}
       INIT_MODULES: ${INIT_MODULES:-}
+      INIT_PASSWORD_HASH: ${INIT_PASSWORD_HASH:-}
       INITDB_OPTIONS: ${INITDB_OPTIONS:-}
 
       # Fix report.url for wkhtmltopdf PDF rendering (TRUE/FALSE)

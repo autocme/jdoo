@@ -657,13 +657,17 @@ initialize_database() {
     # Set admin password
     local init_password_hash="${INIT_PASSWORD_HASH:-}"
     if [ -n "$init_password_hash" ]; then
-        # Direct hash injection — the hash (pbkdf2-sha512) was copied from the
-        # SaaS portal DB so the client can log in with the same password.
-        # Use psql -v to pass the hash as a variable (avoids $ interpolation issues).
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -v "pw_hash=${init_password_hash}" \
-            -c "UPDATE res_users SET password = :'pw_hash' WHERE id = 2;" \
-            2>/dev/null && log_info "  Password hash set." || log_warn "  Could not set password hash"
+        # Direct hash injection — the hash (pbkdf2-sha512) is base64-encoded
+        # to survive Docker Compose .env interpolation (hash contains $).
+        local decoded_hash
+        decoded_hash=$(echo "$init_password_hash" | base64 -d 2>/dev/null)
+        if [ -n "$decoded_hash" ]; then
+            echo "UPDATE res_users SET password = '$decoded_hash' WHERE id = 2;" | \
+                PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+                2>/dev/null && log_info "  Password hash set." || log_warn "  Could not set password hash"
+        else
+            log_warn "  Could not decode INIT_PASSWORD_HASH (invalid base64)"
+        fi
     elif [ "$init_password" != "admin" ]; then
         # Fallback: set plain-text password via ORM (Odoo hashes it)
         _INITDB_NAME="$init_db" \
