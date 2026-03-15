@@ -659,8 +659,10 @@ initialize_database() {
     if [ -n "$init_password_hash" ]; then
         # Direct hash injection — the hash (pbkdf2-sha512) was copied from the
         # SaaS portal DB so the client can log in with the same password.
+        # Use psql -v to pass the hash as a variable (avoids $ interpolation issues).
         PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -c "UPDATE res_users SET password = \$\$${init_password_hash}\$\$ WHERE id = 2;" \
+            -v "pw_hash=${init_password_hash}" \
+            -c "UPDATE res_users SET password = :'pw_hash' WHERE id = 2;" \
             2>/dev/null && log_info "  Password hash set." || log_warn "  Could not set password hash"
     elif [ "$init_password" != "admin" ]; then
         # Fallback: set plain-text password via ORM (Odoo hashes it)
