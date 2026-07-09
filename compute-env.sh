@@ -105,10 +105,10 @@ update_env "PG_VERSION" "$COMPUTED_PG"
 # preserved by the helper.
 # ---------------------------------------------------------------------------
 if [ -z "${ODOO_ADDONS_PATHS:-}" ]; then
-    ODOO_ADDONS_PATHS=$(grep "^ODOO_ADDONS_PATHS=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
+    ODOO_ADDONS_PATHS=$( { grep "^ODOO_ADDONS_PATHS=" .env || true; } | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
 fi
 if [ -z "${RESTART_AFTER:-}" ]; then
-    RESTART_AFTER=$(grep "^RESTART_AFTER=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
+    RESTART_AFTER=$( { grep "^RESTART_AFTER=" .env || true; } | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
 fi
 COMPUTED_RA=$(RESTART_AFTER="${RESTART_AFTER:-}" ODOO_ADDONS_PATHS="${ODOO_ADDONS_PATHS:-}" bash derive-restart-after.sh)
 if [ -n "$COMPUTED_RA" ]; then
