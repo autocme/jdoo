@@ -124,7 +124,9 @@ services:
       conf.admin_passwd: ${ODOO_ADMIN_PASSWORD:-admin_}
 
       # Addons path — oa = Odoo core addons (https://github.com/autocme/oa)
-      conf.addons_path: "/repos/${ODOO_VERSION:-19.0}/oa"
+      # Override via ODOO_ADDONS_PATHS in .env (comma-separated) to add
+      # more JCICD-synced repos, e.g. /repos/19.0/oa,/repos/19.0/custom
+      conf.addons_path: "${ODOO_ADDONS_PATHS:-/repos/${ODOO_VERSION:-19.0}/oa}"
 
       # GeoIP database (shipped in oa repo)
       conf.geoip_city_db: "/repos/${ODOO_VERSION:-19.0}/oa/GeoIP/GeoLite2-City.mmdb"
