@@ -128,8 +128,9 @@ services:
       # more JCICD-synced repos, e.g. /repos/19.0/oa,/repos/19.0/custom
       conf.addons_path: "${ODOO_ADDONS_PATHS:-/repos/${ODOO_VERSION:-19.0}/oa}"
 
-      # GeoIP database (shipped in oa repo)
+      # GeoIP databases (shipped in oa repo — GeoIP/GeoLite2-*.mmdb)
       conf.geoip_city_db: "/repos/${ODOO_VERSION:-19.0}/oa/GeoIP/GeoLite2-City.mmdb"
+      conf.geoip_country_db: "/repos/${ODOO_VERSION:-19.0}/oa/GeoIP/GeoLite2-Country.mmdb"
 
       # Data directory
       conf.data_dir: /var/lib/odoo
