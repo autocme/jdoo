@@ -84,9 +84,15 @@ setup_user_permissions() {
     else
         log_info "Data directory ownership already correct, skipping recursive chown."
     fi
-    # Config and extra-addons are small — always fix
-    chown -R odoo:odoo /etc/odoo || true
-    chown -R odoo:odoo /mnt/extra-addons 2>/dev/null || true
+    # Config and extra-addons — same ownership guard as the data dir
+    # (/mnt/extra-addons is usually mounted :ro and can grow large)
+    if [ "$(stat -c '%u:%g' /etc/odoo 2>/dev/null)" != "${PUID}:${PGID}" ]; then
+        chown -R odoo:odoo /etc/odoo || true
+    fi
+    if [ -d /mnt/extra-addons ] && \
+       [ "$(stat -c '%u:%g' /mnt/extra-addons 2>/dev/null)" != "${PUID}:${PGID}" ]; then
+        chown -R odoo:odoo /mnt/extra-addons 2>/dev/null || true
+    fi
 
     log_info "User permissions configured successfully."
 }
@@ -435,32 +441,35 @@ install_packages() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    # --- Check pip packages in background ---
+    # --- Check pip packages in background (one python process for ALL packages) ---
     if [ -n "$py_install" ]; then
         (
+            local specs=()
             IFS=',' read -ra PKG_ARRAY <<< "$py_install"
             for pkg in "${PKG_ARRAY[@]}"; do
                 pkg=$(echo "$pkg" | xargs)
                 [ -z "$pkg" ] && continue
                 validate_package_name "$pkg" || continue
-                if [[ "$pkg" == *"=="* ]]; then
-                    local pkg_name="${pkg%%==*}"
-                    local pkg_version="${pkg#*==}"
-                    if pip show "$pkg_name" 2>/dev/null | grep -q "Version: $pkg_version"; then
-                        echo "[ok] $pkg" >> "$tmp_dir/py.log"
-                    else
-                        echo "[need] $pkg" >> "$tmp_dir/py.log"
-                        touch "$tmp_dir/py.need"
-                    fi
-                else
-                    if pip show "$pkg" &>/dev/null; then
-                        echo "[ok] $pkg" >> "$tmp_dir/py.log"
-                    else
-                        echo "[need] $pkg" >> "$tmp_dir/py.log"
-                        touch "$tmp_dir/py.need"
-                    fi
-                fi
+                specs+=("$pkg")
             done
+            if [ "${#specs[@]}" -gt 0 ]; then
+                python - "${specs[@]}" > "$tmp_dir/py.log" 2>/dev/null <<'PYCHECK' || touch "$tmp_dir/py.need"
+import re, sys
+from importlib import metadata
+missing = False
+for spec in sys.argv[1:]:
+    name = re.split(r"[\[=<>!~]", spec, 1)[0]          # strip extras + version spec
+    want = spec.split("==", 1)[1] if "==" in spec else None
+    try:
+        have = metadata.version(name)                   # normalizes -, _, . in names
+        ok = want is None or have == want
+    except metadata.PackageNotFoundError:
+        ok = False
+    print(("[ok] " if ok else "[need] ") + spec)
+    missing = missing or not ok
+sys.exit(1 if missing else 0)
+PYCHECK
+            fi
         ) &
         local py_pid=$!
     fi
@@ -493,9 +502,18 @@ install_packages() {
         log_info "Python packages: ${py_install}"
         [ -f "$tmp_dir/py.log" ] && while read -r line; do log_info "  $line"; done < "$tmp_dir/py.log"
         if [ -f "$tmp_dir/py.need" ]; then
-            log_info "Installing Python packages..."
-            local packages="${py_install//,/ }"
-            if pip install --no-cache-dir --quiet $packages; then
+            # Install ONLY the missing packages (specs pass through verbatim,
+            # so pins like asyncssh==2.21.1 are preserved)
+            local missing_pkgs=()
+            while IFS= read -r line; do
+                missing_pkgs+=("${line#\[need\] }")
+            done < <(grep '^\[need\] ' "$tmp_dir/py.log" 2>/dev/null || true)
+            # Defensive fallback: checker crashed without producing a log
+            if [ "${#missing_pkgs[@]}" -eq 0 ]; then
+                read -ra missing_pkgs <<< "${py_install//,/ }"
+            fi
+            log_info "Installing Python packages: ${missing_pkgs[*]}"
+            if pip install --no-cache-dir --quiet "${missing_pkgs[@]}"; then
                 log_info "Python packages installed."
             else
                 log_error "Failed to install Python packages!"
@@ -620,9 +638,13 @@ initialize_database() {
         odoo_flags+=(--without-demo=all)
     fi
 
-    # Language: load all requested languages
+    # Language: load all requested languages. Skip when only the default en_US —
+    # base install already activates en_US (Odoo's source language), and
+    # --load-language=en_US costs a redundant translation pass over all modules.
     local primary_lang="${init_lang%%,*}"
-    odoo_flags+=(--load-language="$init_lang")
+    if [ "$init_lang" != "en_US" ]; then
+        odoo_flags+=(--load-language="$init_lang")
+    fi
 
     cd "$ODOO_SOURCE"
     local init_log="/tmp/odoo-init-$$.log"
@@ -935,7 +957,9 @@ start_odoo() {
 # -----------------------------------------------------------------------------
 rotate_logs() {
     local logfile
-    logfile=$(grep "^logfile" "$ERP_CONF_PATH" 2>/dev/null | sed 's/^logfile *= *//' | xargs)
+    # `|| true`: with set -euo pipefail, a conf without a logfile line would
+    # otherwise kill the whole entrypoint silently (grep exits 1 -> pipefail)
+    logfile=$(grep "^logfile" "$ERP_CONF_PATH" 2>/dev/null | sed 's/^logfile *= *//' | xargs) || true
     if [ -z "$logfile" ] || [ ! -f "$logfile" ]; then
         return 0
     fi
