@@ -55,6 +55,14 @@ if [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
     export COMPOSE_PROJECT_NAME="jdoo${MAJOR}"
 fi
 
+# --- Auto-derive RESTART_AFTER from ODOO_ADDONS_PATHS ---
+# A push to ANY repo in addons_path then restarts the container, with no
+# separate list to maintain. An explicit RESTART_AFTER (if set) is kept.
+_derived_ra="$(RESTART_AFTER="${RESTART_AFTER:-}" ODOO_ADDONS_PATHS="${ODOO_ADDONS_PATHS:-}" bash derive-restart-after.sh)"
+if [ -n "$_derived_ra" ]; then
+    export RESTART_AFTER="$_derived_ra"
+fi
+
 # PG tuning is handled automatically inside the container by pg-auto-tune.sh
 # which reads cgroup-aware RAM (respects Docker --memory limits).
 # Override via .env: PG_SHARED_BUFFERS, PG_EFFECTIVE_CACHE_SIZE, etc.

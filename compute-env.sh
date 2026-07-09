@@ -99,6 +99,24 @@ update_env() {
 update_env "PYTHON_VERSION" "$COMPUTED_PY"
 update_env "PG_VERSION" "$COMPUTED_PG"
 
+# ---------------------------------------------------------------------------
+# Derive RESTART_AFTER from ODOO_ADDONS_PATHS (single source of truth for the
+# repos that should restart the container on push). Explicit RESTART_AFTER is
+# preserved by the helper.
+# ---------------------------------------------------------------------------
+if [ -z "${ODOO_ADDONS_PATHS:-}" ]; then
+    ODOO_ADDONS_PATHS=$(grep "^ODOO_ADDONS_PATHS=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
+fi
+if [ -z "${RESTART_AFTER:-}" ]; then
+    RESTART_AFTER=$(grep "^RESTART_AFTER=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
+fi
+COMPUTED_RA=$(RESTART_AFTER="${RESTART_AFTER:-}" ODOO_ADDONS_PATHS="${ODOO_ADDONS_PATHS:-}" bash derive-restart-after.sh)
+if [ -n "$COMPUTED_RA" ]; then
+    update_env "RESTART_AFTER" "$COMPUTED_RA"
+    export RESTART_AFTER="$COMPUTED_RA"
+    echo "[compute-env] RESTART_AFTER=${COMPUTED_RA} (derived from ODOO_ADDONS_PATHS)"
+fi
+
 # Export for current shell (when used with `source`)
 export PYTHON_VERSION="$COMPUTED_PY"
 export PG_VERSION="$COMPUTED_PG"
