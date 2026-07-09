@@ -88,7 +88,12 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-app
     restart: unless-stopped
     labels:
-      restart-after: "${ODOO_VERSION:-19.0}/oa"
+      # Repos whose push should restart this container to load new code.
+      # Format is repo-name/branch (comma-separated). Defaults to oa on the
+      # active version; override via RESTART_AFTER in .env to cover every
+      # synced addons repo, e.g.:
+      #   RESTART_AFTER=oa/19.0,Accounting/19.0,dashboard/19.0,...
+      restart-after: "${RESTART_AFTER:-oa/${ODOO_VERSION:-19.0}}"
       cicd-role: "${CICD_ROLE:-production}"
     depends_on:
       db:
