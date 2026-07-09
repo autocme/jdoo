@@ -442,6 +442,45 @@ extra-addons/
 
 Mounted read-only at `/mnt/extra-addons`, already included in `addons_path`.
 
+### Multi-Repo Addons Path
+
+Extend `addons_path` with additional synced repos (e.g. JCICD-managed) via `.env` — comma-separated, no compose edits needed:
+
+```ini
+ODOO_ADDONS_PATHS=/repos/19.0/oa,/repos/19.0/Accounting,/repos/19.0/themes
+```
+
+Default (unset) stays `/repos/${ODOO_VERSION}/oa`.
+
+## GeoIP (Fully Automatic)
+
+**If jdoo finds the GeoIP databases inside the `oa` repo, everything is configured automatically — zero manual setup.**
+
+The [oa](https://github.com/autocme/oa) repo ships the MaxMind GeoLite2 databases at `GeoIP/GeoLite2-City.mmdb` and `GeoIP/GeoLite2-Country.mmdb`. Every jdoo deployment points at them out of the box:
+
+```yaml
+conf.geoip_city_db:    /repos/${ODOO_VERSION}/oa/GeoIP/GeoLite2-City.mmdb
+conf.geoip_country_db: /repos/${ODOO_VERSION}/oa/GeoIP/GeoLite2-Country.mmdb
+```
+
+So the full chain works with no extra steps:
+
+1. `oa` is synced into the `repos` volume (e.g. by JCICD) → the `.mmdb` files are present.
+2. `erp.conf` already references them; `proxy_mode = True` is set automatically.
+3. The bundled nginx resolves the **real visitor IP** — behind a Cloudflare tunnel it maps
+   `CF-Connecting-IP` into `X-Forwarded-For` (falling back to the standard proxy chain for
+   direct access), so `request.geoip` sees the visitor, not the internal hop.
+
+Verify inside the running container:
+
+```bash
+docker exec <project>-app python -c "
+import geoip2.database
+print(geoip2.database.Reader('/repos/19.0/oa/GeoIP/GeoLite2-City.mmdb').city('8.8.8.8').country.name)"
+```
+
+Or on a website page (Odoo docs method): add `<h1 t-esc="request.geoip.country.name or 'geoip failure'"/>` — visiting from a public IP should print your country. If the files are absent, Odoo logs a warning and everything else keeps working.
+
 ## Database Initialization
 
 **Disabled by default.** Create databases from the Odoo UI at `/web/database/manager`.
