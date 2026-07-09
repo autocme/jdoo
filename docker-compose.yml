@@ -89,7 +89,7 @@ services:
     restart: unless-stopped
     labels:
       restart-after: "${ODOO_VERSION:-19.0}/oa"
-      cicd-role: "${CICD_ROLE:-staging}"
+      cicd-role: "${CICD_ROLE:-production}"
     depends_on:
       db:
         condition: service_healthy
