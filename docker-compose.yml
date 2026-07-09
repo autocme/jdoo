@@ -49,6 +49,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
+      start_interval: 1s
 
   # ---------------------------------------------------------------------------
   # Nginx Internal Proxy
@@ -182,6 +184,7 @@ services:
       interval: 15s
       timeout: 10s
       start_period: 600s
+      start_interval: 2s
       retries: 3
     networks:
       - internal
