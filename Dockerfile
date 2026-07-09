@@ -92,6 +92,31 @@ RUN set -eux; \
         click-odoo-contrib \
         manifestoo
 
+# -----------------------------------------------------------------------------
+# CUA module dependencies — pre-baked at build time (saves ~31s per deploy).
+# Version-aware: asyncssh 2.21.1 needs cryptography>=39, pdfminer.six/pdfplumber
+# need cryptography>=36 — incompatible with the cryptography==3.4.8 pin on
+# Odoo 15/16 (Python 3.10). Those three stay runtime-installed (PY_INSTALL)
+# on 15/16 only. The constraint file freezes cryptography+pyopenssl at Odoo's
+# requirements.txt pins, so the build FAILS LOUDLY if any package tries to
+# move them (instead of silently breaking `import OpenSSL` at runtime).
+# asyncssh must stay ==2.21.1: newer versions force cryptography>=48.
+# Override the list via: --build-arg CUA_PY_PACKAGES="pkg1 pkg2==1.0 ..."
+# -----------------------------------------------------------------------------
+ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains email-validator feedparser hijridate html2text httpx pdfminer.six pdfplumber rapidfuzz temporalio"
+RUN set -eux; \
+    MAJOR=$(echo "${ODOO_VERSION}" | cut -d. -f1); \
+    PKGS="${CUA_PY_PACKAGES}"; \
+    if [ "$MAJOR" -le 16 ]; then \
+        PKGS=$(printf '%s\n' $PKGS | grep -v -E '^(asyncssh|pdfminer\.six|pdfplumber)' | tr '\n' ' '); \
+    fi; \
+    if [ -n "$(echo $PKGS | xargs)" ]; then \
+        pip freeze | grep -i -E '^(cryptography|pyopenssl)==' > /tmp/crypto-pins.txt; \
+        pip install --no-cache-dir -c /tmp/crypto-pins.txt $PKGS; \
+        rm -f /tmp/crypto-pins.txt; \
+        python -c "import OpenSSL, cryptography; print('OpenSSL OK, cryptography', cryptography.__version__)"; \
+    fi
+
 # =============================================================================
 # Stage 2: RUNTIME - lean image without compilers or -dev headers
 # =============================================================================
