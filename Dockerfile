@@ -102,8 +102,12 @@ RUN set -eux; \
 # move them (instead of silently breaking `import OpenSSL` at runtime).
 # asyncssh must stay ==2.21.1: newer versions force cryptography>=48.
 # Override the list via: --build-arg CUA_PY_PACKAGES="pkg1 pkg2==1.0 ..."
+#
+# Async platform deps (temporalio, dramatiq, redis) are baked here so they
+# survive container recreate instead of being re-fetched every boot via
+# PY_INSTALL. PY_INSTALL still works and can add more packages at runtime.
 # -----------------------------------------------------------------------------
-ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains email-validator feedparser hijridate html2text httpx pdfminer.six pdfplumber rapidfuzz temporalio"
+ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains email-validator feedparser hijridate html2text httpx pdfminer.six pdfplumber rapidfuzz temporalio dramatiq redis"
 RUN set -eux; \
     MAJOR=$(echo "${ODOO_VERSION}" | cut -d. -f1); \
     PKGS="${CUA_PY_PACKAGES}"; \

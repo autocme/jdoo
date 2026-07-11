@@ -98,6 +98,45 @@ setup_user_permissions() {
 }
 
 # -----------------------------------------------------------------------------
+# Optional: Docker socket access for the odoo user (DEFAULT OFF)
+# -----------------------------------------------------------------------------
+# Opt-in only. When DOCKER_GID (or ENABLE_DOCKER_SOCKET) is set we add the odoo
+# user to a group matching the mounted docker socket's GID, *while still root and
+# before any `exec gosu odoo ...`*. This is the proven pattern: compose
+# `group_add` alone is insufficient because gosu drops supplementary groups on
+# privilege drop — adding odoo to the GID in /etc/group here makes gosu
+# re-derive the group from /etc/group so the dropped process keeps socket access.
+#
+# 🔴 SECURITY: NEVER mount the raw docker socket into the public app container in
+# production — a raw /var/run/docker.sock is root-equivalent on the host. If Odoo
+# must introspect containers, expose it through a READ-ONLY docker-socket-proxy
+# (e.g. tecnativa/docker-socket-proxy) scoped to GET endpoints. This hook only
+# fixes group perms for whatever socket IS provided; it does not mount one.
+setup_docker_access() {
+    # Default OFF: do nothing unless explicitly opted in.
+    if [ -z "${DOCKER_GID:-}" ] && [ -z "${ENABLE_DOCKER_SOCKET:-}" ]; then
+        return 0
+    fi
+
+    local docker_gid="${DOCKER_GID:-}"
+    # If only ENABLE_DOCKER_SOCKET is set, derive the GID from the mounted socket.
+    if [ -z "$docker_gid" ] && [ -S /var/run/docker.sock ]; then
+        docker_gid=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$docker_gid" ]; then
+        log_info "Docker access requested but no DOCKER_GID and no /var/run/docker.sock — skipping."
+        return 0
+    fi
+
+    log_info "Enabling docker socket access for odoo (GID=${docker_gid})..."
+    # 2>/dev/null || true: the group/membership may already exist on restart, and
+    # a name/GID clash must not abort the entrypoint.
+    groupadd -g "$docker_gid" docker_host 2>/dev/null || true
+    usermod -aG "$docker_gid" odoo 2>/dev/null || true
+}
+
+# -----------------------------------------------------------------------------
 # Step 2: Auto-compute resource allocation from container CPU/RAM
 # Detects cgroup v1/v2 limits, calculates workers and memory limits
 # All values overridable via WORKERS, MAX_CRON_THREADS, LIMIT_MEMORY_* env vars
@@ -993,6 +1032,11 @@ main() {
 
     # Step 1: Setup user permissions (PUID/PGID)
     setup_user_permissions
+
+    # Step 1b: Optional docker socket access (opt-in via DOCKER_GID; default OFF).
+    # Runs once here while still root so it applies to every start path below
+    # (start_odoo and the custom-command `exec gosu odoo ...`).
+    setup_docker_access
 
     # Step 2: Auto-compute resource allocation (workers, memory limits)
     compute_resources
