@@ -3,7 +3,7 @@
 # jdoo - Addons Path Query Script
 # =============================================================================
 # Reads the configured addons_path from erp.conf and outputs each path
-# on its own line. Designed for JCICD and other orchestrators.
+# on its own line. Designed for j_jdoo_cicd and other orchestrators.
 #
 # Usage:
 #   docker exec <container> /usr/local/bin/addons-path.sh

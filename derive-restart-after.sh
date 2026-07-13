@@ -2,7 +2,7 @@
 # =============================================================================
 # derive-restart-after.sh — compute RESTART_AFTER from ODOO_ADDONS_PATHS
 # =============================================================================
-# The JCICD `restart-after` container label lists the repos whose push should
+# The j_jdoo_cicd `restart-after` container label lists the repos whose push should
 # restart this container to load new code. To avoid maintaining it separately
 # from the addons_path, derive it from ODOO_ADDONS_PATHS: every path of the
 # form /repos/<branch>/<repo> becomes an entry <repo>/<branch>.

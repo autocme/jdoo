@@ -106,7 +106,7 @@ services:
       # Custom addons (read-only)
       - ./extra-addons:/mnt/extra-addons:ro
 
-      # Repos volume - synced addons from JCICD (read-only)
+      # Repos volume - synced addons from j_jdoo_cicd (read-only)
       - repos:/repos:ro
 
     environment:
@@ -130,7 +130,7 @@ services:
 
       # Addons path — oa = Odoo core addons (https://github.com/autocme/oa)
       # Override via ODOO_ADDONS_PATHS in .env (comma-separated) to add
-      # more JCICD-synced repos, e.g. /repos/19.0/oa,/repos/19.0/custom
+      # more j_jdoo_cicd-synced repos, e.g. /repos/19.0/oa,/repos/19.0/custom
       conf.addons_path: "${ODOO_ADDONS_PATHS:-/repos/${ODOO_VERSION:-19.0}/oa}"
 
       # GeoIP databases (shipped in oa repo — GeoIP/GeoLite2-*.mmdb)

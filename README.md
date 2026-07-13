@@ -13,7 +13,7 @@ Universal Odoo Docker setup. One configuration, all versions (15.0 - 19.0+).
 - **9-step smart entrypoint** — handles resources, config, packages, DB init, upgrades, and PDF fix
 - **Stateless package management** — Python/NPM packages checked and installed on every startup
 - **Multi-database auto-upgrade** — detects and upgrades all databases on restart
-- **JCICD integration** — optional external volume for synced addons via CI/CD pipeline
+- **j_jdoo_cicd integration** — optional external volume for synced addons via CI/CD pipeline
 - **Architecture support** — amd64 and arm64
 
 ## Dependencies
@@ -21,11 +21,11 @@ Universal Odoo Docker setup. One configuration, all versions (15.0 - 19.0+).
 | Project | Role | Description |
 |---------|------|-------------|
 | [autocme/oc](https://github.com/autocme/oc) | **Build-time** | Optimized Odoo source code (~80% smaller than official), cloned into the Docker image via `ODOO_REPO` |
-| [autocme/oa](https://github.com/autocme/oa) | **Runtime** | Odoo core addons, synced to `/repos/{version}/oa` by JCICD |
-| [autocme/JCICD](https://github.com/autocme/JCICD) | **CI/CD** (optional) | Pipeline engine that syncs repos, triggers upgrades, and manages deployments |
+| [autocme/oa](https://github.com/autocme/oa) | **Runtime** | Odoo core addons, synced to `/repos/{version}/oa` by j_jdoo_cicd |
+| [j_jdoo_cicd](https://github.com/jaahit/saas) | **CI/CD** (optional) | Central Odoo module that git-syncs repos, triggers upgrades over SSH, and manages deployments |
 
 > **oc vs oa**: `oc` is the Odoo source baked into the Docker image at build time.
-> `oa` is the addons repo synced at runtime by JCICD into `/repos/{version}/oa`.
+> `oa` is the addons repo synced at runtime by j_jdoo_cicd into `/repos/{version}/oa`.
 > To use the official Odoo repo instead of `oc`, set `ODOO_REPO=https://github.com/odoo/odoo.git` in `.env`.
 
 ## Quick Start
@@ -132,10 +132,10 @@ location /websocket/ {
 The default `conf.addons_path` includes:
 
 ```
-/repos/{version}/oa       # Odoo core addons via JCICD (read-only, if mounted)
+/repos/{version}/oa       # Odoo core addons via j_jdoo_cicd (read-only, if mounted)
 ```
 
-> `oa` is [autocme/oa](https://github.com/autocme/oa) — Odoo core addons synced by JCICD.
+> `oa` is [autocme/oa](https://github.com/autocme/oa) — Odoo core addons synced by j_jdoo_cicd.
 
 **Adding custom addons:** Create a `docker-compose.override.yml` in your repo to mount an external volume:
 
@@ -149,7 +149,7 @@ volumes:
     external: true
 ```
 
-**With JCICD:** The `repos` external volume is already mounted at `/repos` (read-only) in `docker-compose.yml`. JCICD syncs repos into `/repos/{version}/{repo}` (e.g., `/repos/19.0/oa`). The `conf.addons_path` is pre-configured to use it.
+**With j_jdoo_cicd:** The `repos` external volume is already mounted at `/repos` (read-only) in `docker-compose.yml`. j_jdoo_cicd syncs repos into `/repos/{version}/{repo}` (e.g., `/repos/19.0/oa`). The `conf.addons_path` is pre-configured to use it.
 
 ## Full Example: Deploy Odoo 17
 
@@ -444,7 +444,7 @@ Mounted read-only at `/mnt/extra-addons`, already included in `addons_path`.
 
 ### Multi-Repo Addons Path
 
-Extend `addons_path` with additional synced repos (e.g. JCICD-managed) via `.env` — comma-separated, no compose edits needed:
+Extend `addons_path` with additional synced repos (e.g. j_jdoo_cicd-managed) via `.env` — comma-separated, no compose edits needed:
 
 ```ini
 ODOO_ADDONS_PATHS=/repos/19.0/oa,/repos/19.0/Accounting,/repos/19.0/themes
@@ -465,7 +465,7 @@ conf.geoip_country_db: /repos/${ODOO_VERSION}/oa/GeoIP/GeoLite2-Country.mmdb
 
 So the full chain works with no extra steps:
 
-1. `oa` is synced into the `repos` volume (e.g. by JCICD) → the `.mmdb` files are present.
+1. `oa` is synced into the `repos` volume (e.g. by j_jdoo_cicd) → the `.mmdb` files are present.
 2. `erp.conf` already references them; `proxy_mode = True` is set automatically.
 3. The bundled nginx resolves the **real visitor IP** — behind a Cloudflare tunnel it maps
    `CF-Connecting-IP` into `X-Forwarded-For` (falling back to the standard proxy chain for
@@ -549,7 +549,7 @@ When `AUTO_UPGRADE=TRUE`, on every container restart:
 ## External Upgrade (upgrade.sh)
 
 The container includes a standalone `upgrade.sh` script that can be called externally via `docker exec`.
-This gives orchestrators like [JCICD](https://github.com/autocme/JCICD) the ability to
+This gives orchestrators like [j_jdoo_cicd](https://github.com/jaahit/saas) the ability to
 trigger upgrades on-demand and check the result via exit code.
 
 **How it works:**
@@ -598,12 +598,12 @@ docker exec <container> /usr/local/bin/upgrade.sh --check
 [INFO] All upgrades succeeded. Restart the container to load new code.
 ```
 
-### JCICD Integration
+### j_jdoo_cicd Integration
 
-JCICD can use `upgrade.sh` in its sync workflow:
+j_jdoo_cicd can use `upgrade.sh` in its sync workflow:
 
 ```
-JCICD flow:
+j_jdoo_cicd flow:
   1. git pull (sync new code)         → /repos/{branch}/{repo}
   2. docker exec upgrade.sh           → pauses Odoo, upgrades DBs, resumes Odoo
   3. Check exit code                  → 0 = success, 1 = failure
@@ -612,7 +612,7 @@ JCICD flow:
 
 **Health output during upgrade:**
 
-| Health Output | Meaning | JCICD Action |
+| Health Output | Meaning | j_jdoo_cicd Action |
 |---------------|---------|---------------------|
 | `UPGRADING` | Upgrade in progress, Odoo paused | Keep waiting |
 | `UPGRADE_FAILED` | Upgrade failed, Odoo resumed with old code | Mark job failed |
@@ -623,12 +623,12 @@ JCICD flow:
 **Workflow A: Auto-upgrade on restart (simple)**
 
 Set `AUTO_UPGRADE=TRUE` in `.env`. The entrypoint runs the upgrade at Step 7
-(before Odoo starts). JCICD just restarts the container and polls the healthcheck.
+(before Odoo starts). j_jdoo_cicd just restarts the container and polls the healthcheck.
 
-**Workflow B: External upgrade via docker exec (recommended with JCICD)**
+**Workflow B: External upgrade via docker exec (recommended with j_jdoo_cicd)**
 
 Set `AUTO_UPGRADE=FALSE` in `.env` to prevent the entrypoint from running upgrades on restart.
-JCICD calls `upgrade.sh` explicitly after syncing code, checks the exit code,
+j_jdoo_cicd calls `upgrade.sh` explicitly after syncing code, checks the exit code,
 then restarts the container to load updated modules.
 
 > **Important:** When using `upgrade.sh`, set `AUTO_UPGRADE=FALSE` to avoid running
@@ -637,7 +637,7 @@ then restarts the container to load updated modules.
 ## Addons Path Query (addons-path.sh)
 
 Returns the configured `addons_path` from `erp.conf`, one path per line.
-Useful for JCICD and other orchestrators to discover where addons live.
+Useful for j_jdoo_cicd and other orchestrators to discover where addons live.
 
 ```bash
 docker exec <container> /usr/local/bin/addons-path.sh
@@ -816,10 +816,10 @@ The `docker-compose.yml` includes container labels for orchestrator integration:
 
 | Label | Default | Description |
 |-------|---------|-------------|
-| `restart-after` | `{ODOO_VERSION}/oa` | JCICD triggers restart when this repo is synced |
+| `restart-after` | `{ODOO_VERSION}/oa` | j_jdoo_cicd triggers restart when this repo is synced |
 | `cicd-role` | `staging` | Identifies the deployment role (`staging` / `production`) |
 
-These labels allow JCICD and other CI/CD tools to discover and manage containers automatically.
+These labels allow j_jdoo_cicd and other CI/CD tools to discover and manage containers automatically.
 
 ## Architecture
 
@@ -837,6 +837,6 @@ These labels allow JCICD and other CI/CD tools to discover and manage containers
 │         │                          │                         │
 │    db-data vol               odoo-data vol                   │
 │                               extra-addons/ (ro)             │
-│                               repos/ (ro, JCICD)             │
+│                               repos/ (ro, j_jdoo_cicd)             │
 └─────────────────────────────────────────────────────────────┘
 ```

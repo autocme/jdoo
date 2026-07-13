@@ -3,7 +3,7 @@
 # jdoo - Standalone Module Upgrade Script
 # =============================================================================
 # Runs click-odoo-update on Odoo databases sequentially (one at a time).
-# Designed to be called externally by JCICD or other orchestrators.
+# Designed to be called externally by j_jdoo_cicd or other orchestrators.
 #
 # Flow:
 #   1. Pause Odoo (SIGSTOP) to prevent DB conflicts
