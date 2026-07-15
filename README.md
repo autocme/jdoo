@@ -27,6 +27,8 @@ Universal Odoo Docker setup. One configuration, all versions (15.0 - 19.0+).
 > **oc vs oa**: `oc` is the Odoo source baked into the Docker image at build time.
 > `oa` is the addons repo synced at runtime by j_jdoo_cicd into `/repos/{version}/oa`.
 > To use the official Odoo repo instead of `oc`, set `ODOO_REPO=https://github.com/odoo/odoo.git` in `.env`.
+> `oc` is **private**: never store a GitHub token inside `.env` — inject it only for the build
+> (shell env beats `.env`): `ODOO_REPO="https://x-access-token:<token>@github.com/autocme/oc.git" ./jdoo build odoo`.
 
 ## Quick Start
 
@@ -150,6 +152,18 @@ volumes:
 ```
 
 **With j_jdoo_cicd:** The `repos` external volume is already mounted at `/repos` (read-only) in `docker-compose.yml`. j_jdoo_cicd syncs repos into `/repos/{version}/{repo}` (e.g., `/repos/19.0/oa`). The `conf.addons_path` is pre-configured to use it.
+
+> ⚠️ **The `repos` volume MUST expose the directory j_jdoo_cicd syncs to** (its *Base Path*, default `/repos` on the host). A plain `docker volume create repos` does **not** do that — its data lives under `/var/lib/docker/volumes/repos/_data` where the host-side git sync never writes. Create it as a **bind volume** before the first `up`:
+>
+> ```bash
+> sudo mkdir -p /repos && sudo chown $USER: /repos
+> docker volume create --driver local --opt type=none --opt o=bind --opt device=/repos repos
+> ```
+>
+> (j_jdoo_cicd's Discover step auto-creates this bind volume when it is missing, and logs a
+> `WARNING` when an existing `repos` volume does not expose the sync base path. An existing
+> mismatched volume can also be bridged with a bind mount:
+> `mount --bind /var/lib/docker/volumes/repos/_data /repos` + an `/etc/fstab` entry.)
 
 ## Full Example: Deploy Odoo 17
 
@@ -516,11 +530,8 @@ INIT_MODULES=base,web,sale,account
 ### How It Works
 
 1. **Check existence** — if the database already exists, creation is skipped (modules are still installed if `INIT_MODULES` is set).
-2. **Start Odoo temporarily** — a background Odoo process starts on the configured port (default `8069`) with no cron threads and no workers.
-3. **Create database via XML-RPC** — calls Odoo's native `/xmlrpc/2/db` `create_database` endpoint with all 7 supported fields (name, login, password, language, country, demo, master password).
-4. **Set phone** — if `INIT_PHONE` is set, updates the admin user's partner phone via `/xmlrpc/2/object`.
-5. **Install modules** — if `INIT_MODULES` is set, updates the module list and installs each module via `button_immediate_install`.
-6. **Stop temporary Odoo** — the background process is terminated before the main Odoo startup (Step 9).
+2. **Create the database directly** — `odoo-bin -d $INIT_DB -i base[,$INIT_MODULES] --stop-after-init --no-http` (plus `--without-demo=all` unless `INIT_DEMO=TRUE` and `--load-language` for non-`en_US`). No temporary HTTP server and no XML-RPC involved.
+3. **Post-configure the admin user** — login, password (or `INIT_PASSWORD_HASH`), phone, language and country are applied directly through the ORM/SQL after creation.
 
 ### Legacy Mode
 
@@ -654,20 +665,25 @@ This prevents orchestrators (Dokploy, Swarm, Kubernetes) from killing the contai
 
 | State | When | Healthcheck | Docker Status |
 |-------|------|-------------|---------------|
-| `STARTING` | Steps 1-5 (permissions, config, packages) | exit 0 | healthy |
-| `INITIALIZING` | Step 6 (database initialization) | exit 0 | healthy |
-| `UPGRADING` | Step 7 (module auto-upgrade) | exit 0 | healthy |
-| `UPGRADE_RETRY` | Upgrade retry in progress | exit 0 | healthy |
-| `RUNNING` | Step 9 (Odoo HTTP responding) | checks HTTP | healthy |
-| `RUNNING_LOADING` | Step 9 (Odoo process alive, loading modules) | exit 0 | healthy |
+| `STARTING` | Steps 1-5 (permissions, config, packages) | exit 1 | starting (covered by `start_period: 600s`) |
+| `INITIALIZING` | Step 6 (database initialization) | exit 1 | starting (covered by `start_period`) |
+| `UPGRADING` | Step 7 (module auto-upgrade / external upgrade.sh) | exit 1 | starting or unhealthy after retries |
+| `UPGRADE_RETRY` | Upgrade retry in progress | exit 1 | starting or unhealthy after retries |
+| `RUNNING` | Step 9 (Odoo HTTP responding) | exit 0 | healthy |
+| `RUNNING_LOADING` | Step 9 (Odoo process alive, loading modules) | exit 1 | starting (covered by `start_period`) |
 | `UPGRADE_FAILED` | Module upgrade failed | exit 1 | unhealthy |
 | `RUNNING_NO_PROCESS` | Odoo process not found (crashed) | exit 1 | unhealthy |
 
+Every transitional state exits **1**; the container is protected during boot by the compose
+healthcheck's `start_period: 600s` (failures inside the start period don't count), and turns
+healthy on the first successful HTTP probe. An orchestrator should therefore read the *state
+token* from the health log (see below), not just the boolean health status.
+
 When the state is `RUNNING`, the healthcheck performs a 3-layer check:
 
-1. **Process check** — is `odoo-bin` process alive? If not → `RUNNING_NO_PROCESS` (unhealthy)
-2. **HTTP check** — does `/web/login` respond? If yes → `RUNNING` (healthy)
-3. **Loading grace** — process alive but HTTP not ready → `RUNNING_LOADING` (healthy, still booting)
+1. **Process check** — is `odoo-bin` process alive? If not → `RUNNING_NO_PROCESS` (exit 1)
+2. **HTTP check** — does `/web/login` respond? If yes → `RUNNING` (exit 0, healthy)
+3. **Loading grace** — process alive but HTTP not ready → `RUNNING_LOADING` (exit 1, absorbed by `start_period` during boot)
 
 **Check the current state:**
 
@@ -816,10 +832,13 @@ The `docker-compose.yml` includes container labels for orchestrator integration:
 
 | Label | Default | Description |
 |-------|---------|-------------|
-| `restart-after` | `{ODOO_VERSION}/oa` | j_jdoo_cicd triggers restart when this repo is synced |
-| `cicd-role` | `staging` | Identifies the deployment role (`staging` / `production`) |
+| `restart-after` | `oa/{ODOO_VERSION}` (e.g. `oa/19.0`) | Comma-separated `repo/branch` list; j_jdoo_cicd targets this container when one of them is pushed. Auto-derived from `ODOO_ADDONS_PATHS` by `./jdoo` / `compute-env.sh`; explicit `RESTART_AFTER` in `.env` wins. |
+| `cicd-role` | `production` | Deployment role. `staging` = canary deployed first (gates production); `worker` / `skip` / `none` / `ignore` = never touched by j_jdoo_cicd. Set via `CICD_ROLE` in `.env`. |
 
 These labels allow j_jdoo_cicd and other CI/CD tools to discover and manage containers automatically.
+A dedicated Temporal worker stack should set `CICD_ROLE=worker` so the CI/CD never restarts the
+container executing its own pipeline (j_jdoo_cicd also auto-skips containers whose command runs
+the `temporal` subcommand).
 
 ## Architecture
 
