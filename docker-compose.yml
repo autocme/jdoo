@@ -27,6 +27,14 @@ services:
     image: postgres:${PG_VERSION:-17}-alpine
     container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-db
     restart: unless-stopped
+    # Per-tenant cgroup cap so pg-auto-tune sizes shared_buffers from the container's
+    # own RAM, not the host's. Default 0 = no cap (standalone/dev behaviour unchanged).
+    # NOTE: default MUST be 0, never empty — an empty value is a fatal compose parse error.
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0}"
+          memory: "${DB_MEMORY:-0}"
     entrypoint: ["/usr/local/bin/pg-auto-tune.sh"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-odoo}
@@ -87,6 +95,15 @@ services:
         ODOO_REPO: ${ODOO_REPO:-https://github.com/autocme/oc.git}
     container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-app
     restart: unless-stopped
+    # Per-tenant cgroup cap. entrypoint.sh (compute_resources) reads /sys/fs/cgroup
+    # cpu.max + memory.max, so capping here makes jdoo auto-compute the RIGHT worker
+    # count for the tenant instead of the whole host. Default 0 = no cap (standalone
+    # unchanged). 🔴 default MUST be 0, never empty (empty = fatal compose parse error).
+    deploy:
+      resources:
+        limits:
+          cpus: "${ODOO_CPUS:-0}"
+          memory: "${ODOO_MEMORY:-0}"
     labels:
       # Repos whose push should restart this container to load new code.
       # Format is repo-name/branch (comma-separated). Defaults to oa on the
