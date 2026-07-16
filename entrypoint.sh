@@ -902,17 +902,27 @@ fix_report_url() {
 # -----------------------------------------------------------------------------
 # Step 8b: Set web.base.url from the SaaS-assigned domain
 # A fresh Odoo DB defaults web.base.url to http://localhost:8069 and only rewrites
-# it when an ADMIN logs in over a real host. An unattended SaaS tenant that nobody
-# logs into via its domain therefore keeps `localhost:8069` — which then leaks into
-# EVERY outbound URL: the j_agent registration api_url (master can't reach it),
-# e-mails, portal links, password-reset links, etc. Root-cause fix: derive the URL
-# from the tenant's own domain (TENANT_DOMAIN, already injected for Traefik; or an
-# explicit WEB_BASE_URL) and write it + freeze it BEFORE Odoo starts — so the very
-# first boot's registration already reports the real domain and it never drifts.
-# Idempotent + runs every boot, so a domain change propagates on the next deploy.
+# it when an ADMIN logs in over a real host (res_users.authenticate, gated by the
+# web.base.url.freeze param). An unattended SaaS tenant that nobody logs into via
+# its domain therefore keeps `localhost:8069` — which then leaks into EVERY
+# outbound URL: the j_agent registration api_url (master can't reach it), e-mails,
+# portal links, password-reset links, etc.
+#
+# Root-cause fix = BOOTSTRAP web.base.url to the tenant's domain (TENANT_DOMAIN,
+# already injected for Traefik; or an explicit WEB_BASE_URL) BEFORE Odoo starts,
+# so the very first boot's registration reports a real URL. Two deliberate rules:
+#   * ONLY-IF-LOCALHOST: never overwrite a real value already there, so an admin
+#     switching the tenant to a CUSTOM domain (Odoo updates web.base.url on their
+#     login) is preserved across restarts, and platform domain changes still flow
+#     in via the same admin-login path.
+#   * NO FREEZE: we DELETE any web.base.url.freeze so Odoo's own admin-login update
+#     keeps working (freezing would block both domain changes and custom domains).
+#     NB: freeze is truthy for ANY non-empty value ('False' included) — must be
+#     absent, hence DELETE, not set-to-False.
 # Skipped when neither var is set (standalone/dev keep Odoo's default behaviour).
-# NB: distinct from report.url above, which stays localhost on purpose (internal
-# wkhtmltopdf asset fetch).
+# Distinct from report.url above, which stays localhost on purpose (internal
+# wkhtmltopdf asset fetch). The master reaches the agent via a STABLE platform URL
+# (conf.agent_public_url), so a client custom domain never breaks master<->agent.
 # -----------------------------------------------------------------------------
 set_web_base_url() {
     local base_url="${WEB_BASE_URL:-}"
@@ -941,16 +951,18 @@ set_web_base_url() {
     fi
 
     for db_name in $db_list; do
-        echo "INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
-             VALUES ('web.base.url', :'u', 1, 1, now(), now())
-             ON CONFLICT (key) DO UPDATE SET value = :'u', write_date = now();
+        echo "DELETE FROM ir_config_parameter WHERE key = 'web.base.url.freeze';
              INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
-             VALUES ('web.base.url.freeze', 'True', 1, 1, now(), now())
-             ON CONFLICT (key) DO UPDATE SET value = 'True', write_date = now();" | \
+             VALUES ('web.base.url', :'u', 1, 1, now(), now())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, write_date = now()
+             WHERE ir_config_parameter.value LIKE 'http://localhost%'
+                OR ir_config_parameter.value LIKE 'http://127.0.0.1%'
+                OR ir_config_parameter.value IS NULL
+                OR ir_config_parameter.value = '';" | \
         PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
             -v "u=${base_url}" \
             2>/dev/null && \
-        log_info "  web.base.url = ${base_url} (frozen) -> ${db_name}" || \
+        log_info "  web.base.url bootstrap (only if unset/localhost) -> ${base_url} -> ${db_name}" || \
         log_warn "  Could not set web.base.url for ${db_name} (new database?)"
     done
 }
