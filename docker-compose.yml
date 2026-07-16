@@ -76,8 +76,24 @@ services:
       ODOO_PORT: "8069"
     volumes:
       - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    # Dokploy/Traefik ingress. The proxy joins dokploy-network so Traefik (which
+    # watches that network) can reach it; the master/SaaS control plane then hits
+    # the tenant over its own domain instead of a host IP:port. Labels are INERT
+    # unless TRAEFIK_ENABLE=true — set per-tenant by j_dokploy when a domain is
+    # assigned (with TENANT_DOMAIN). Standalone/dev: TRAEFIK_ENABLE unset -> false
+    # -> Traefik ignores the container; the label metadata is harmless.
+    # 🔴 dokploy-network must EXIST on the host: Dokploy provides it; the ./jdoo
+    # wrapper `docker network create`s it for standalone/dev (see wrapper).
     networks:
       - internal
+      - dokploy-network
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-jdoo}.rule=Host(`${TENANT_DOMAIN:-jdoo.invalid}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-jdoo}.entrypoints=web"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-jdoo}.service=${COMPOSE_PROJECT_NAME:-jdoo}"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-jdoo}.loadbalancer.server.port=8069"
 
   # ---------------------------------------------------------------------------
   # Odoo Application
@@ -240,3 +256,10 @@ volumes:
 networks:
   internal:
     driver: bridge
+
+  # Shared Dokploy/Traefik network. external=true → must pre-exist on the host.
+  # Dokploy creates it; for standalone/dev the ./jdoo wrapper creates it too so a
+  # plain `docker compose up` does not fail. It stays empty/unused where no Traefik
+  # runs, so attaching the proxy to it is harmless outside Dokploy.
+  dokploy-network:
+    external: true

@@ -69,6 +69,13 @@ fi
 
 echo "[jdoo] Odoo ${ODOO_VERSION} | Python ${PYTHON_VERSION} | PG ${PG_VERSION} | Port ${ODOO_PORT:-8069} | Project ${COMPOSE_PROJECT_NAME}"
 
+# --- Ensure the shared Traefik network exists ---
+# docker-compose.yml declares dokploy-network as external (Dokploy provides it in
+# production). For standalone/dev create it once so `docker compose up` does not
+# fail; it stays empty/unused when no Traefik runs.
+docker network inspect dokploy-network >/dev/null 2>&1 || \
+    docker network create dokploy-network >/dev/null 2>&1 || true
+
 # --- Build compose file list ---
 COMPOSE_FILES="-f docker-compose.yml"
 if [ -f docker-compose.override.yml ]; then
