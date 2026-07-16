@@ -115,6 +115,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Pass through ALL deploy .env vars so CUSTOM conf.* keys (e.g. conf.master_webhook
+    # set by a SaaS orchestrator) reach the container env — the entrypoint's conf.*->erp.conf
+    # generator scans the container env, so without this only the hardcoded conf.* below are
+    # written. The explicit `environment:` block still wins on any overlapping key.
+    env_file:
+      - path: .env
+        required: false
     # No ports exposed to host — nginx handles external access
     volumes:
       # Persistent data (filestore, sessions, logs)
