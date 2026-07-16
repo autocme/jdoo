@@ -900,6 +900,62 @@ fix_report_url() {
 }
 
 # -----------------------------------------------------------------------------
+# Step 8b: Set web.base.url from the SaaS-assigned domain
+# A fresh Odoo DB defaults web.base.url to http://localhost:8069 and only rewrites
+# it when an ADMIN logs in over a real host. An unattended SaaS tenant that nobody
+# logs into via its domain therefore keeps `localhost:8069` — which then leaks into
+# EVERY outbound URL: the j_agent registration api_url (master can't reach it),
+# e-mails, portal links, password-reset links, etc. Root-cause fix: derive the URL
+# from the tenant's own domain (TENANT_DOMAIN, already injected for Traefik; or an
+# explicit WEB_BASE_URL) and write it + freeze it BEFORE Odoo starts — so the very
+# first boot's registration already reports the real domain and it never drifts.
+# Idempotent + runs every boot, so a domain change propagates on the next deploy.
+# Skipped when neither var is set (standalone/dev keep Odoo's default behaviour).
+# NB: distinct from report.url above, which stays localhost on purpose (internal
+# wkhtmltopdf asset fetch).
+# -----------------------------------------------------------------------------
+set_web_base_url() {
+    local base_url="${WEB_BASE_URL:-}"
+    if [ -z "$base_url" ] && [ -n "${TENANT_DOMAIN:-}" ]; then
+        base_url="https://${TENANT_DOMAIN}"
+    fi
+    if [ -z "$base_url" ]; then
+        log_info "No WEB_BASE_URL / TENANT_DOMAIN set, skipping web.base.url fix."
+        return 0
+    fi
+
+    local db_host db_port db_user db_password
+    db_host=$(printenv 'conf.db_host' || echo 'db')
+    db_port=$(printenv 'conf.db_port' || echo '5432')
+    db_user=$(printenv 'conf.db_user' || echo 'odoo')
+    db_password=$(printenv 'conf.db_password' || echo 'odoo')
+
+    local db_list
+    db_list=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
+        "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1') ORDER BY datname;" \
+        2>/dev/null | xargs)
+
+    if [ -z "$db_list" ]; then
+        log_info "No databases found, skipping web.base.url fix."
+        return 0
+    fi
+
+    for db_name in $db_list; do
+        echo "INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
+             VALUES ('web.base.url', :'u', 1, 1, now(), now())
+             ON CONFLICT (key) DO UPDATE SET value = :'u', write_date = now();
+             INSERT INTO ir_config_parameter (key, value, create_uid, write_uid, create_date, write_date)
+             VALUES ('web.base.url.freeze', 'True', 1, 1, now(), now())
+             ON CONFLICT (key) DO UPDATE SET value = 'True', write_date = now();" | \
+        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+            -v "u=${base_url}" \
+            2>/dev/null && \
+        log_info "  web.base.url = ${base_url} (frozen) -> ${db_name}" || \
+        log_warn "  Could not set web.base.url for ${db_name} (new database?)"
+    done
+}
+
+# -----------------------------------------------------------------------------
 # Step 9: Start Odoo
 # Supports two modes:
 #   Default: exec (Odoo becomes PID 1) - best signal handling
@@ -1063,6 +1119,10 @@ main() {
 
     # Step 8: Fix report.url for wkhtmltopdf PDF reports
     fix_report_url
+
+    # Step 8b: Set web.base.url from the SaaS-assigned domain BEFORE Odoo starts,
+    # so the j_agent registration on boot reports the real domain (not localhost).
+    set_web_base_url
 
     # Step 9: Start Odoo or execute custom command
     set_state "RUNNING"
