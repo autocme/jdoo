@@ -462,6 +462,50 @@ generate_config() {
 }
 
 # -----------------------------------------------------------------------------
+# Security: never run with a default/placeholder master password. admin_passwd
+# gates the DB manager (create/drop/dump/restore ANY database), so a well-known
+# default (e.g. the compose fallback 'admin_' or a leftover .env.example
+# CHANGE_ME) makes the instance a takeover primitive. Rather than refuse to
+# start (which would break the existing fleet, most of which runs the default)
+# we AUTO-GENERATE a strong master password once and persist it in the data
+# volume, so it is stable across restarts and requires zero manual input.
+# Nothing in the platform depends on KNOWING this value (it only guards this
+# instance's own DB manager; the control plane talks to tenants via API keys),
+# so generating it silently is safe. A deliberately-set strong password is left
+# untouched. The value itself is never logged.
+# -----------------------------------------------------------------------------
+ensure_admin_password() {
+    local pw persist newpw
+    pw="$(printenv 'conf.admin_passwd' 2>/dev/null)"
+    case "$pw" in
+        ""|admin|admin_|odoo|CHANGE_ME|CHANGEME|changeme|change_me|password|PASSWORD|123456|admin123)
+            persist="${DATA_DIR:-/var/lib/odoo}/.admin_passwd"
+            if [ -f "$persist" ] && [ -s "$persist" ]; then
+                newpw="$(cat "$persist")"
+                log_info "Master password: using the persisted auto-generated value."
+            else
+                newpw="$(openssl rand -base64 24 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-24)"
+                [ -z "$newpw" ] && newpw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
+                mkdir -p "$(dirname "$persist")"
+                printf '%s' "$newpw" > "$persist"
+                chown odoo:odoo "$persist" 2>/dev/null || true
+                chmod 600 "$persist"
+                log_warn "conf.admin_passwd was an insecure default -> auto-generated a strong master password."
+                log_warn "  Stored at ${persist} (chmod 600). Retrieve it there if you need DB-manager access."
+            fi
+            if grep -q '^admin_passwd' "$ERP_CONF_PATH"; then
+                sed -i "s|^admin_passwd = .*|admin_passwd = ${newpw}|" "$ERP_CONF_PATH"
+            else
+                echo "admin_passwd = ${newpw}" >> "$ERP_CONF_PATH"
+            fi
+            ;;
+        *)
+            log_info "Master password: strong value in use."
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # Step 4+5: Package Installation (PY_INSTALL + NPM_INSTALL)
 # Checks pip and npm packages in PARALLEL for faster startup.
 # Stateless - checks if packages are installed at each startup.
@@ -1111,6 +1155,9 @@ main() {
 
     # Step 3: Generate Odoo configuration from conf.* env vars
     generate_config
+
+    # Step 3b: Ensure a strong master password (auto-generate if default)
+    ensure_admin_password
 
     # Apply computed resources to erp.conf (after config generation)
     apply_resources
