@@ -12,6 +12,7 @@
 #   UPGRADING        → exit 1 (module upgrade in progress — not ready)
 #   RUNNING          → exit 0 if HTTP responds, exit 1 if still loading
 #   RUNNING_NO_PROCESS → exit 1 (Odoo process not found — crashed)
+#   DB_INCOMPLETE    → exit 1 (init interrupted / addons missing — half-created DB)
 #   UPGRADE_FAILED   → exit 1 (module upgrade failed)
 #   UNKNOWN          → exit 1 (state file missing or unrecognized)
 #
@@ -58,6 +59,14 @@ case "$STATE" in
 
         # Process alive but HTTP not ready — still loading modules
         echo "RUNNING_LOADING"
+        exit 1
+        ;;
+    DB_INCOMPLETE)
+        # A previous DB init was interrupted, or the shared addons volume is
+        # empty → the DB is half-created / non-functional. Report unhealthy so the
+        # platform never treats this tenant as ready. (entrypoint refuses to serve
+        # it; no data is dropped.)
+        echo "DB_INCOMPLETE"
         exit 1
         ;;
     UPGRADE_FAILED)

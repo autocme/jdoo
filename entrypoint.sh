@@ -633,6 +633,40 @@ PYCHECK
 }
 
 # -----------------------------------------------------------------------------
+# #3 helpers: guard against half-initialized DBs (empty addons / interrupted init)
+# -----------------------------------------------------------------------------
+# True when at least one directory on the CONFIGURED addons_path actually
+# contains an Odoo module (an __manifest__.py). The framework's own odoo/addons
+# (base/web core) is auto-added by Odoo and is NOT on this path, so an empty
+# result means the shared repos/oa addons volume has not been synced yet.
+_addons_path_has_modules() {
+    local ap d oldifs
+    ap=$(grep '^addons_path' "$ERP_CONF_PATH" 2>/dev/null | sed 's/^addons_path *= *//')
+    [ -z "$ap" ] && return 1
+    oldifs="$IFS"; IFS=','
+    for d in $ap; do
+        IFS="$oldifs"
+        d=$(echo "$d" | xargs)
+        if [ -d "$d" ] && [ -n "$(find "$d" -maxdepth 2 -name '__manifest__.py' 2>/dev/null | head -1)" ]; then
+            return 0
+        fi
+        IFS=','
+    done
+    IFS="$oldifs"
+    return 1
+}
+
+# Per-DB "init completed successfully" marker path.
+_init_sentinel() { echo "${ODOO_DATA_DIR}/.db-init-complete.$1"; }
+
+# Write the completion sentinel (idempotent, owned by odoo).
+_write_init_sentinel() {
+    local f; f=$(_init_sentinel "$1")
+    touch "$f" 2>/dev/null || true
+    chown odoo:odoo "$f" 2>/dev/null || true
+}
+
+# -----------------------------------------------------------------------------
 # Step 6: Database Initialization via odoo-bin --stop-after-init
 # Creates DB directly (no temporary Odoo server needed), then configures
 # login, password, language, country, phone via SQL post-init.
@@ -681,6 +715,33 @@ initialize_database() {
 
     if [ "$db_exists" = "1" ]; then
         log_info "Database '${init_db}' already exists, skipping creation."
+        # #3: distinguish a fully-initialized DB from a half-created one (odoo-bin
+        # killed mid-install leaves the PG row but no schema). Trust the completion
+        # sentinel; if absent, verify base is installed. NEVER drop a DB.
+        local sentinel; sentinel=$(_init_sentinel "$init_db")
+        if [ ! -f "$sentinel" ]; then
+            # Separate CONNECTIVITY from the base-state result. Under `set -e` a bare
+            # psql pipeline that fails would hard-exit the container and crash-loop a
+            # HEALTHY existing DB whenever PG is transiently busy/recovering. So probe
+            # connectivity first and fail OPEN on a connection error (serve as before,
+            # re-verify next boot); only a SUCCESSFUL connection that shows base is not
+            # installed means the DB is genuinely half-created → refuse (never drop).
+            local base_state=""
+            if echo "SELECT 1;" | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA >/dev/null 2>&1; then
+                base_state=$(echo "SELECT state FROM ir_module_module WHERE name='base';" | \
+                    PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA 2>/dev/null | xargs) || base_state=""
+                if [ "$base_state" = "installed" ]; then
+                    _write_init_sentinel "$init_db"
+                    log_info "Existing DB '${init_db}' verified (base installed); backfilled init sentinel."
+                else
+                    set_state "DB_INCOMPLETE"
+                    log_error "Database '${init_db}' exists but is INCOMPLETE (base state='${base_state:-absent}') — a previous init was interrupted. NOT dropping it; refusing to serve a broken DB. Drop it manually to let a clean init run, then restart."
+                    return 1
+                fi
+            else
+                log_warn "Could not connect to existing DB '${init_db}' to verify completeness (transient?). Proceeding to serve it as before; will re-verify on next boot."
+            fi
+        fi
         # Still install modules if requested on existing DB
         if [ -n "$init_modules" ]; then
             log_info "Installing modules on existing DB: ${init_modules}..."
@@ -700,6 +761,14 @@ initialize_database() {
         return 0
     fi
 
+    # #3 guard: refuse to create a DB when the addons_path has no modules (shared
+    # repos/oa volume empty/unsynced) — otherwise odoo-bin creates the Postgres DB
+    # row then crashes mid-install → a half-created DB served forever.
+    if ! _addons_path_has_modules; then
+        set_state "DB_INCOMPLETE"
+        log_error "Refusing to initialize '${init_db}': addons_path has no modules — the shared 'repos' volume (e.g. /repos/${ODOO_VERSION}/oa) is empty or not synced. Run the CICD sync / Prepare for the addons repo, then restart."
+        return 1
+    fi
     log_info "Creating database '${init_db}' via odoo-bin (direct mode)..."
     log_info "  Login: ${init_login}, Lang: ${init_lang}, Country: ${init_country:-auto}, Demo: ${init_demo}"
 
@@ -818,6 +887,7 @@ print('OK')
             2>/dev/null && log_info "  Country set: ${country_upper}" || log_warn "  Could not set country"
     fi
 
+    _write_init_sentinel "$init_db"
     log_info "Database initialization complete."
 }
 

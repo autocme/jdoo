@@ -287,10 +287,18 @@ ENV PYTHONPATH="${ODOO_SOURCE}:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 # Copy entrypoint script
 # -----------------------------------------------------------------------------
-COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY --chmod=755 healthcheck.sh /usr/local/bin/healthcheck.sh
-COPY --chmod=755 upgrade.sh /usr/local/bin/upgrade.sh
-COPY --chmod=755 addons-path.sh /usr/local/bin/addons-path.sh
+# NB: plain COPY + RUN chmod (not `COPY --chmod`) so the image builds on the
+# legacy Docker builder too — `--chmod` requires BuildKit. Files land root:root
+# 755 (entrypoint runs as root, drops to odoo via gosu), world-executable so the
+# dropped process can also exec them.
+COPY entrypoint.sh   /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh  /usr/local/bin/healthcheck.sh
+COPY upgrade.sh      /usr/local/bin/upgrade.sh
+COPY addons-path.sh  /usr/local/bin/addons-path.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh \
+              /usr/local/bin/healthcheck.sh \
+              /usr/local/bin/upgrade.sh \
+              /usr/local/bin/addons-path.sh
 
 WORKDIR /opt/odoo
 
