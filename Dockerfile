@@ -77,12 +77,12 @@ RUN set -eux; \
     \
     # Common Odoo dependencies (all versions) \
     pip install --no-cache-dir \
-        phonenumbers \
-        python-stdnum \
+        phonenumbers==9.0.34 \
+        python-stdnum==1.19 \
         vobject \
         xlrd \
         xlwt \
-        num2words \
+        num2words==0.5.13 \
         passlib \
         polib; \
     \
@@ -107,7 +107,7 @@ RUN set -eux; \
 # survive container recreate instead of being re-fetched every boot via
 # PY_INSTALL. PY_INSTALL still works and can add more packages at runtime.
 # -----------------------------------------------------------------------------
-ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains email-validator feedparser hijridate html2text httpx pdfminer.six pdfplumber rapidfuzz temporalio dramatiq redis"
+ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains==0.0.229 email-validator==2.3.0 feedparser hijridate==2.6.0 html2text==2025.4.15 httpx pdfminer.six==20260107 pdfplumber rapidfuzz temporalio dramatiq redis moyasar==0.6.5 arabic-reshaper==3.0.1 inflect==7.5.0 pikepdf==10.10.0"
 RUN set -eux; \
     MAJOR=$(echo "${ODOO_VERSION}" | cut -d. -f1); \
     PKGS="${CUA_PY_PACKAGES}"; \
