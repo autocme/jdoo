@@ -1,0 +1,110 @@
+# =============================================================================
+# shared-pg-stack — one shared Postgres + PgBouncer PER WORKER NODE
+# =============================================================================
+# Deploy ONCE per worker node (via a j.dokploy.instance compose stack, or a plain
+# `docker compose up -d`). Tenant jdoo stacks reach `shared-pgbouncer:6432` over the
+# external `pg-net` network; the master runs DDL directly on Postgres via
+#   docker exec -i shared-postgres psql -U postgres         (local socket = passwordless)
+# so no Postgres port is published and no superuser password ever leaves the host.
+#
+# Prereqs on the node:  docker network create pg-net
+# Secrets (.env):       PG_SUPERPASS, AUTH_PASS   (see .env.example)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Shared Postgres — reachable only on pg-backend (no published port).
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17
+    container_name: shared-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_SUPERPASS:?PG_SUPERPASS required}
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Consumed by init/00-auth.sh (first boot) to create the pgbouncer_auth role
+      # with the SAME password PgBouncer will present from its userlist.
+      AUTH_PASS: ${AUTH_PASS:?AUTH_PASS required}
+    command:
+      - postgres
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-500}
+      - -c
+      - superuser_reserved_connections=10
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - password_encryption=scram-sha-256
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - pg-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # PgBouncer — session pooling, scram + auth_query (no reload on tenant churn).
+  # Reachable by tenants on pg-net as `shared-pgbouncer:6432`. :6432 NOT published.
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.23.1-p3
+    container_name: shared-pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Same password as the pgbouncer_auth PG role (init/00-auth.sh). Alphanumeric only.
+      AUTH_PASS: ${AUTH_PASS:?AUTH_PASS required}
+    # Write the auth_file from AUTH_PASS at start (no secret baked into the image / git),
+    # then exec pgbouncer with the mounted config. `$$` escapes compose interpolation so
+    # the shell expands AUTH_PASS at runtime.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        case "$$AUTH_PASS" in *[!A-Za-z0-9]*|"") echo "FATAL: AUTH_PASS must be alphanumeric" >&2; exit 1;; esac
+        printf '"pgbouncer_auth" "%s"\n' "$$AUTH_PASS" > /tmp/userlist.txt
+        chmod 600 /tmp/userlist.txt
+        exec pgbouncer /etc/pgbouncer/pgbouncer.ini
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+    networks:
+      pg-backend:
+      pg-net:
+        aliases:
+          - shared-pgbouncer
+    healthcheck:
+      # Port-listen probe (busybox nc). Full path is exercised by the live test matrix
+      # (SHOW POOLS / a tenant connect through 6432).
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  # Private backend: only postgres + pgbouncer. Postgres is never on pg-net.
+  pg-backend:
+    driver: bridge
+  # Shared with tenant jdoo stacks. external=true → create once: `docker network create pg-net`.
+  pg-net:
+    external: true

@@ -479,7 +479,7 @@ ensure_admin_password() {
     pw="$(printenv 'conf.admin_passwd' 2>/dev/null)"
     case "$pw" in
         ""|admin|admin_|odoo|CHANGE_ME|CHANGEME|changeme|change_me|password|PASSWORD|123456|admin123)
-            persist="${DATA_DIR:-/var/lib/odoo}/.admin_passwd"
+            persist="${ODOO_DATA_DIR:-/var/lib/odoo}/.admin_passwd"
             if [ -f "$persist" ] && [ -s "$persist" ]; then
                 newpw="$(cat "$persist")"
                 log_info "Master password: using the persisted auto-generated value."
@@ -708,24 +708,35 @@ initialize_database() {
     db_user=$(printenv 'conf.db_user' || echo 'odoo')
     db_password=$(printenv 'conf.db_password' || echo 'odoo')
 
-    local db_exists
-    db_exists=$(echo "SELECT 1 FROM pg_database WHERE datname = :'dbname';" | \
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres \
-        -v "dbname=${init_db}" -tA 2>/dev/null | xargs)
+    # Existence probe. A least-priv shared-cluster role may be DENIED the `postgres`
+    # maintenance DB (or PgBouncer may not route it), so try a direct connect to the
+    # tenant's OWN db first; only fall back to the pg_database catalog probe on refusal
+    # (dev/standalone, or a genuinely-absent db).
+    local db_exists=""
+    if PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tAc "SELECT 1" >/dev/null 2>&1; then
+        db_exists=1
+    else
+        db_exists=$(echo "SELECT 1 FROM pg_database WHERE datname = :'dbname';" | \
+            PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres \
+            -v "dbname=${init_db}" -tA 2>/dev/null | xargs) || db_exists=""
+    fi
 
     if [ "$db_exists" = "1" ]; then
-        log_info "Database '${init_db}' already exists, skipping creation."
-        # #3: distinguish a fully-initialized DB from a half-created one (odoo-bin
-        # killed mid-install leaves the PG row but no schema). Trust the completion
-        # sentinel; if absent, verify base is installed. NEVER drop a DB.
+        # Classify an existing DB three ways (NEVER drop one):
+        #   (a) sentinel present OR base installed       → serve as-is (+ backfill sentinel)
+        #   (b) no sentinel, connected, base absent, EMPTY (0 public tables)
+        #                                                → master pre-created it → install base INTO it
+        #   (c) no sentinel, base absent but HAS tables  → genuine half-init → DB_INCOMPLETE
+        # (b) is the shared-PG path: the tenant role owns an empty DB (no CREATEDB needed —
+        # odoo-bin sees DatabaseExists, skips CREATE, installs base into the existing DB).
         local sentinel; sentinel=$(_init_sentinel "$init_db")
+        local serve_existing=1
         if [ ! -f "$sentinel" ]; then
             # Separate CONNECTIVITY from the base-state result. Under `set -e` a bare
             # psql pipeline that fails would hard-exit the container and crash-loop a
             # HEALTHY existing DB whenever PG is transiently busy/recovering. So probe
             # connectivity first and fail OPEN on a connection error (serve as before,
-            # re-verify next boot); only a SUCCESSFUL connection that shows base is not
-            # installed means the DB is genuinely half-created → refuse (never drop).
+            # re-verify next boot).
             local base_state=""
             if echo "SELECT 1;" | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA >/dev/null 2>&1; then
                 base_state=$(echo "SELECT state FROM ir_module_module WHERE name='base';" | \
@@ -734,31 +745,48 @@ initialize_database() {
                     _write_init_sentinel "$init_db"
                     log_info "Existing DB '${init_db}' verified (base installed); backfilled init sentinel."
                 else
-                    set_state "DB_INCOMPLETE"
-                    log_error "Database '${init_db}' exists but is INCOMPLETE (base state='${base_state:-absent}') — a previous init was interrupted. NOT dropping it; refusing to serve a broken DB. Drop it manually to let a clean init run, then restart."
-                    return 1
+                    # base not installed → EMPTY pre-created DB, or genuine corruption?
+                    # Count ALL tables in public via pg_class (world-readable), not
+                    # information_schema.tables (privilege-filtered — would hide tables the
+                    # tenant role doesn't own and falsely read as EMPTY).
+                    local tbls
+                    tbls=$(echo "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname='public';" | \
+                        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA 2>/dev/null | xargs) || tbls=""
+                    if [ "${tbls:-0}" = "0" ]; then
+                        log_info "Existing DB '${init_db}' is EMPTY (master pre-created) — installing base into it."
+                        serve_existing=0    # fall through to the init routine below
+                    else
+                        set_state "DB_INCOMPLETE"
+                        log_error "Database '${init_db}' exists but is INCOMPLETE (has tables, base state='${base_state:-absent}') — a previous init was interrupted. NOT dropping it; refusing to serve a broken DB. Drop it manually to let a clean init run, then restart."
+                        return 1
+                    fi
                 fi
             else
                 log_warn "Could not connect to existing DB '${init_db}' to verify completeness (transient?). Proceeding to serve it as before; will re-verify on next boot."
             fi
         fi
-        # Still install modules if requested on existing DB
-        if [ -n "$init_modules" ]; then
-            log_info "Installing modules on existing DB: ${init_modules}..."
-            cd "$ODOO_SOURCE"
-            local module_list="${init_modules//,/,}"
-            if gosu odoo python odoo-bin -c "$ERP_CONF_PATH" \
-                -d "$init_db" -i "$module_list" \
-                --stop-after-init --no-http --max-cron-threads=0 > /tmp/odoo-mod-$$.log 2>&1; then
-                log_info "Modules installed successfully."
-            else
-                log_warn "Module install exited with error, check logs."
+
+        if [ "$serve_existing" = "1" ]; then
+            log_info "Database '${init_db}' already exists, skipping creation."
+            # Still install modules if requested on existing DB
+            if [ -n "$init_modules" ]; then
+                log_info "Installing modules on existing DB: ${init_modules}..."
+                cd "$ODOO_SOURCE"
+                local module_list="${init_modules//,/,}"
+                if gosu odoo python odoo-bin -c "$ERP_CONF_PATH" \
+                    -d "$init_db" -i "$module_list" \
+                    --stop-after-init --no-http --max-cron-threads=0 > /tmp/odoo-mod-$$.log 2>&1; then
+                    log_info "Modules installed successfully."
+                else
+                    log_warn "Module install exited with error, check logs."
+                fi
+                grep -E "(Installing module|ERROR)" /tmp/odoo-mod-$$.log | tail -10 | \
+                    while IFS= read -r line; do log_info "  $line"; done || true
+                rm -f /tmp/odoo-mod-$$.log
             fi
-            grep -E "(Installing module|ERROR)" /tmp/odoo-mod-$$.log | tail -10 | \
-                while IFS= read -r line; do log_info "  $line"; done || true
-            rm -f /tmp/odoo-mod-$$.log
+            return 0
         fi
-        return 0
+        # serve_existing=0 → EMPTY pre-created DB → fall through to init (install base into it).
     fi
 
     # #3 guard: refuse to create a DB when the addons_path has no modules (shared
@@ -769,7 +797,7 @@ initialize_database() {
         log_error "Refusing to initialize '${init_db}': addons_path has no modules — the shared 'repos' volume (e.g. /repos/${ODOO_VERSION}/oa) is empty or not synced. Run the CICD sync / Prepare for the addons repo, then restart."
         return 1
     fi
-    log_info "Creating database '${init_db}' via odoo-bin (direct mode)..."
+    log_info "Initializing database '${init_db}' via odoo-bin (installs base; creates the DB only if absent)..."
     log_info "  Login: ${init_login}, Lang: ${init_lang}, Country: ${init_country:-auto}, Demo: ${init_demo}"
 
     # Build module list: base + any extra modules (installed in one shot)
@@ -822,9 +850,10 @@ initialize_database() {
 
     # Set admin login (username/email)
     if [ "$init_login" != "admin" ]; then
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -c "UPDATE res_users SET login = \$\$${init_login}\$\$ WHERE id = 2;
-                UPDATE res_partner SET email = \$\$${init_login}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+        echo "UPDATE res_users SET login = :'login' WHERE id = 2;
+              UPDATE res_partner SET email = :'login' WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" | \
+            PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -v "login=${init_login}" \
             2>/dev/null && log_info "  Login set: ${init_login}" || log_warn "  Could not set login"
     fi
 
@@ -865,15 +894,17 @@ print('OK')
 
     # Set phone number if provided
     if [ -n "$init_phone" ]; then
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -c "UPDATE res_partner SET phone = \$\$${init_phone}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+        echo "UPDATE res_partner SET phone = :'phone' WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" | \
+            PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -v "phone=${init_phone}" \
             2>/dev/null && log_info "  Phone set: ${init_phone}" || log_warn "  Could not set phone"
     fi
 
     # Set default language for admin user (lang is on res_partner)
     if [ -n "$primary_lang" ] && [ "$primary_lang" != "en_US" ]; then
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -c "UPDATE res_partner SET lang = \$\$${primary_lang}\$\$ WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" \
+        echo "UPDATE res_partner SET lang = :'lang' WHERE id = (SELECT partner_id FROM res_users WHERE id = 2);" | \
+            PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -v "lang=${primary_lang}" \
             2>/dev/null && log_info "  Language set: ${primary_lang}" || log_warn "  Could not set language"
     fi
 
@@ -881,9 +912,10 @@ print('OK')
     if [ -n "$init_country" ]; then
         local country_upper
         country_upper=$(echo "$init_country" | tr '[:lower:]' '[:upper:]')
-        PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-            -c "UPDATE res_partner SET country_id = (SELECT id FROM res_country WHERE code = \$\$${country_upper}\$\$ LIMIT 1)
-                WHERE id = (SELECT partner_id FROM res_company WHERE id = 1);" \
+        echo "UPDATE res_partner SET country_id = (SELECT id FROM res_country WHERE code = :'country' LIMIT 1)
+              WHERE id = (SELECT partner_id FROM res_company WHERE id = 1);" | \
+            PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
+            -v "country=${country_upper}" \
             2>/dev/null && log_info "  Country set: ${country_upper}" || log_warn "  Could not set country"
     fi
 
@@ -913,11 +945,14 @@ run_auto_upgrade() {
         log_info "Ignoring core addons during upgrade (UPGRADE_IGNORE_CORE=TRUE)"
     fi
 
-    # Discover databases
-    local db_list="${ODOO_DB_NAME:-}"
+    # Discover databases. On the shared cluster ODOO_DB_NAME (== the tenant's own DB)
+    # is always set, so we NEVER enumerate pg_database (which would list — and try to
+    # upgrade — every OTHER tenant's DB). INIT_DB is a fallback for the same scoping.
+    # Only a true dev/standalone box (neither set) falls back to full enumeration.
+    local db_list="${ODOO_DB_NAME:-${INIT_DB:-}}"
 
     if [ -z "$db_list" ]; then
-        log_info "ODOO_DB_NAME not set, discovering all Odoo databases..."
+        log_info "ODOO_DB_NAME/INIT_DB not set, discovering all Odoo databases..."
 
         local db_host db_port db_user db_password
         db_host=$(printenv 'conf.db_host' || echo 'db')
@@ -991,10 +1026,15 @@ fix_report_url() {
     db_user=$(printenv 'conf.db_user' || echo 'odoo')
     db_password=$(printenv 'conf.db_password' || echo 'odoo')
 
-    local db_list
-    db_list=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
-        "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1') ORDER BY datname;" \
-        2>/dev/null | xargs)
+    # Scope to the tenant's OWN DB on a shared cluster (ODOO_DB_NAME/INIT_DB). Only a
+    # true dev/standalone box (neither set) enumerates every DB. This prevents writing
+    # report.url into OTHER tenants' databases.
+    local db_list="${ODOO_DB_NAME:-${INIT_DB:-}}"
+    if [ -z "$db_list" ]; then
+        db_list=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
+            "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1') ORDER BY datname;" \
+            2>/dev/null | xargs)
+    fi
 
     if [ -z "$db_list" ]; then
         log_info "No databases found, skipping report.url fix."
@@ -1054,10 +1094,16 @@ set_web_base_url() {
     db_user=$(printenv 'conf.db_user' || echo 'odoo')
     db_password=$(printenv 'conf.db_password' || echo 'odoo')
 
-    local db_list
-    db_list=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
-        "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1') ORDER BY datname;" \
-        2>/dev/null | xargs)
+    # 🔴 Scope to the tenant's OWN DB (ODOO_DB_NAME/INIT_DB). This function runs on
+    # essentially EVERY boot (TENANT_DOMAIN is always injected), so on a shared cluster
+    # an unscoped pg_database enumeration would rewrite web.base.url in EVERY tenant's
+    # DB. Only a true dev/standalone box (neither var set) enumerates all DBs.
+    local db_list="${ODOO_DB_NAME:-${INIT_DB:-}}"
+    if [ -z "$db_list" ]; then
+        db_list=$(PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -t -c \
+            "SELECT datname FROM pg_database WHERE datname NOT IN ('postgres', 'template0', 'template1') ORDER BY datname;" \
+            2>/dev/null | xargs)
+    fi
 
     if [ -z "$db_list" ]; then
         log_info "No databases found, skipping web.base.url fix."

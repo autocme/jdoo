@@ -27,6 +27,11 @@ services:
     image: postgres:${PG_VERSION:-17}-alpine
     container_name: ${COMPOSE_PROJECT_NAME:-jdoo}-db
     restart: unless-stopped
+    # Local Postgres ONLY under the `localdb` profile: dev/standalone (./jdoo sets
+    # COMPOSE_PROFILES=localdb) and any tenant still on a per-stack DB. On the shared-PG
+    # SaaS path the profile is inactive → this service is not created, and odoo talks to
+    # the node-local PgBouncer via DB_HOST/DB_PORT instead. See odoo.depends_on (required:false).
+    profiles: ["localdb"]
     # Per-tenant cgroup cap so pg-auto-tune sizes shared_buffers from the container's
     # own RAM, not the host's. Default 0 = no cap (standalone/dev behaviour unchanged).
     # NOTE: default MUST be 0, never empty — an empty value is a fatal compose parse error.
@@ -131,6 +136,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
+        # required:false → when the `localdb` profile is inactive (shared-PG SaaS path)
+        # the `db` service is absent; without this, Compose v2 aborts with
+        # "depends on undefined service db". With it, the dependency is simply dropped
+        # (odoo connects to the external PgBouncer and retries PG itself). Under the
+        # localdb profile the health-gate is still honoured.
+        required: false
     # Pass through ALL deploy .env vars so CUSTOM conf.* keys (e.g. conf.master_webhook
     # set by a SaaS orchestrator) reach the container env — the entrypoint's conf.*->erp.conf
     # generator scans the container env, so without this only the hardcoded conf.* below are
@@ -158,11 +169,17 @@ services:
       # Odoo Configuration (conf.* -> /etc/odoo/erp.conf)
       # -------------------------------------------------------------------
       # Database
-      conf.db_host: db
-      conf.db_port: 5432
+      # DB_HOST/DB_PORT: unset (dev/localdb) → local `db` container; SaaS injects the
+      # node-local PgBouncer (shared-pgbouncer:6432) reached over pg-net.
+      conf.db_host: ${DB_HOST:-db}
+      conf.db_port: ${DB_PORT:-5432}
       conf.db_user: ${POSTGRES_USER:-odoo}
       conf.db_password: ${POSTGRES_PASSWORD:-odoo}
-      conf.db_name: "False"
+      # ODOO_DB_NAME: unset (dev) → "False" (multi-db, DB manager on); SaaS pins the
+      # tenant DB so Odoo binds to exactly its own DB on the shared cluster.
+      # conf.dbfilter / conf.list_db are injected by the master via .env passthrough
+      # (they are absent from this environment: block on purpose, so they are not shadowed).
+      conf.db_name: "${ODOO_DB_NAME:-False}"
       conf.db_template: template0
 
       # Admin password
@@ -236,6 +253,9 @@ services:
       retries: 3
     networks:
       - internal
+      # Node-local shared Postgres/PgBouncer network (SaaS). Empty/unused for dev
+      # (localdb): odoo reaches the local `db` over `internal`. See networks: pg-net.
+      - pg-net
 
 # =============================================================================
 # Volumes
@@ -262,4 +282,11 @@ networks:
   # plain `docker compose up` does not fail. It stays empty/unused where no Traefik
   # runs, so attaching the proxy to it is harmless outside Dokploy.
   dokploy-network:
+    external: true
+
+  # Node-local shared Postgres/PgBouncer network (SaaS shared-PG topology). external=true
+  # → must pre-exist: the shared-pg-stack creates it in prod; the ./jdoo wrapper
+  # `docker network create`s it for dev so a plain `docker compose up` does not fail.
+  # Empty/unused under the localdb profile (dev uses the local `db` on `internal`).
+  pg-net:
     external: true

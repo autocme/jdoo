@@ -55,6 +55,14 @@ if [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
     export COMPOSE_PROJECT_NAME="jdoo${MAJOR}"
 fi
 
+# --- Dev/standalone runs a LOCAL Postgres (the `localdb` compose profile) ---
+# The `db` service is gated behind profiles:["localdb"]. Dev activates it here so
+# `./jdoo up` keeps a local PG exactly as before. The SaaS path deploys via plain
+# `docker compose` (no wrapper) and leaves COMPOSE_PROFILES unset → the `db` service is
+# profiled out and Odoo connects to the node's shared PgBouncer (DB_HOST/DB_PORT).
+# Never put COMPOSE_PROFILES in a real .env shipped to SaaS — keep it wrapper-only.
+export COMPOSE_PROFILES="${COMPOSE_PROFILES:-localdb}"
+
 # --- Auto-derive RESTART_AFTER from ODOO_ADDONS_PATHS ---
 # A push to ANY repo in addons_path then restarts the container, with no
 # separate list to maintain. An explicit RESTART_AFTER (if set) is kept.
@@ -75,6 +83,12 @@ echo "[jdoo] Odoo ${ODOO_VERSION} | Python ${PYTHON_VERSION} | PG ${PG_VERSION} 
 # fail; it stays empty/unused when no Traefik runs.
 docker network inspect dokploy-network >/dev/null 2>&1 || \
     docker network create dokploy-network >/dev/null 2>&1 || true
+
+# --- Ensure the shared PG network exists (external in compose) ---
+# In production the shared-pg-stack creates pg-net; for standalone/dev create it once
+# so `docker compose up` does not fail. It stays empty/unused under the localdb profile.
+docker network inspect pg-net >/dev/null 2>&1 || \
+    docker network create pg-net >/dev/null 2>&1 || true
 
 # --- Build compose file list ---
 COMPOSE_FILES="-f docker-compose.yml"
