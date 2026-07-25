@@ -23,6 +23,17 @@ BEGIN
 END
 \$do\$;
 
+-- #5 tenant isolation (in the `postgres` DB — first-boot only; the master provision
+-- applies the SAME revoke inside every tenant DB, since the ACL is per-database and a
+-- tenant can read catalogs from its own db). Deny enumeration of the whole cluster via
+-- the shared catalogs (pg_database/pg_roles expose ALL tenant db/role names). CONNECT is
+-- KEPT: odoo needs it for its cron LISTEN/NOTIFY on `postgres` and its every-boot
+-- _create_empty_database check — with SELECT revoked that check raises InsufficientPrivilege
+-- which Odoo's cli/server.py already catches (boots fine). A plain REVOKE *CONNECT* would
+-- instead crash-loop every tenant (verified live) — do NOT do that. Superusers and the
+-- SECURITY DEFINER pgbouncer_auth.get_auth bypass this PUBLIC ACL, so auth is unaffected.
+REVOKE SELECT ON pg_catalog.pg_database, pg_catalog.pg_roles FROM PUBLIC;
+
 CREATE SCHEMA IF NOT EXISTS pgbouncer_auth AUTHORIZATION "$POSTGRES_USER";
 REVOKE ALL ON SCHEMA pgbouncer_auth FROM PUBLIC;
 GRANT USAGE ON SCHEMA pgbouncer_auth TO pgbouncer_auth;
