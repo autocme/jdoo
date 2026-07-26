@@ -349,15 +349,33 @@ compute_resources() {
         log_info "  Memory soft: ${soft_mb}MB/worker (auto: 85% RAM / ${total_procs} procs)"
     fi
 
+    # limit_memory_soft and limit_memory_hard are NOT the same measurement, and
+    # deriving one from the other by a small factor is the bug:
+    #   * soft is compared against RSS  — resident pages, what the box actually
+    #     spends. Odoo recycles the worker gracefully after the request.
+    #   * hard is applied with setrlimit(RLIMIT_AS) — ADDRESS SPACE, i.e. VSZ.
+    #     Exceeding it is an instant MemoryError wherever the allocation lands.
+    # An Odoo worker's VSZ sits far above its RSS (per-thread arenas, mapped
+    # libraries, the PostgreSQL client, jemalloc/glibc reservations) — a factor
+    # of 3-4 is ordinary. So soft*1.3 hands a worker an address-space ceiling
+    # BELOW its own steady-state VSZ: on a small container every worker died on
+    # startup and the tenant crash-looped with an out-of-memory traceback while
+    # sitting at a few hundred MB of real usage.
     local limit_memory_hard
     if [ -n "${LIMIT_MEMORY_HARD:-}" ]; then
         limit_memory_hard="$LIMIT_MEMORY_HARD"
         local hard_mb=$(( limit_memory_hard / 1024 / 1024 ))
         log_info "  Memory hard: ${hard_mb}MB (from LIMIT_MEMORY_HARD env var)"
     else
-        limit_memory_hard=$(( limit_memory_soft * 13 / 10 ))
+        # Address space is virtual: a ceiling above physical RAM costs nothing
+        # and never gets committed. It exists only to stop a runaway allocation,
+        # so it is derived from VSZ reality, not from the RSS budget.
+        local vsz_ratio=4
+        local min_hard=2147483648   # 2GB — measured floor for a bare Odoo worker
+        limit_memory_hard=$(( limit_memory_soft * vsz_ratio ))
+        [ "$limit_memory_hard" -lt "$min_hard" ] && limit_memory_hard=$min_hard
         local hard_mb=$(( limit_memory_hard / 1024 / 1024 ))
-        log_info "  Memory hard: ${hard_mb}MB/worker (auto: soft*1.3)"
+        log_info "  Memory hard: ${hard_mb}MB/worker (auto: RLIMIT_AS ceiling = soft*${vsz_ratio}, floor ${min_hard}B — address space, not RSS)"
     fi
 
     # --- Save computed values (applied after generate_config) ---
@@ -477,6 +495,8 @@ generate_config() {
 ensure_admin_password() {
     local pw persist newpw
     pw="$(printenv 'conf.admin_passwd' 2>/dev/null)"
+    # Whitespace is not a password. Without this, "   " took the strong branch.
+    pw="$(printf '%s' "$pw" | tr -d '[:space:]')"
     case "$pw" in
         ""|admin|admin_|odoo|CHANGE_ME|CHANGEME|changeme|change_me|password|PASSWORD|123456|admin123)
             persist="${ODOO_DATA_DIR:-/var/lib/odoo}/.admin_passwd"
@@ -486,6 +506,17 @@ ensure_admin_password() {
             else
                 newpw="$(openssl rand -base64 24 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-24)"
                 [ -z "$newpw" ] && newpw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
+                # Both generators are pipelines that can yield an EMPTY string
+                # (no openssl, unreadable /dev/urandom, tr stripping everything).
+                # The old code wrote whatever came out, so a failed generator
+                # silently published `admin_passwd = ` — an unauthenticated
+                # database manager, which is worse than the weak default it was
+                # replacing. Generation failure now stops the boot.
+                if [ "${#newpw}" -lt 20 ]; then
+                    set_state "ADMIN_PASSWORD_FAILED"
+                    log_error "Could not generate a master password (got ${#newpw} usable chars, need >= 20). Refusing to start with an empty or weak admin_passwd. Set conf.admin_passwd explicitly to a strong value and restart."
+                    exit 1
+                fi
                 mkdir -p "$(dirname "$persist")"
                 printf '%s' "$newpw" > "$persist"
                 chown odoo:odoo "$persist" 2>/dev/null || true
@@ -737,8 +768,24 @@ initialize_database() {
             # HEALTHY existing DB whenever PG is transiently busy/recovering. So probe
             # connectivity first and fail OPEN on a connection error (serve as before,
             # re-verify next boot).
-            local base_state=""
-            if echo "SELECT 1;" | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA >/dev/null 2>&1; then
+            # Connectivity is retried before it is believed. PostgreSQL may still
+            # be starting, recovering, or briefly at max_connections when the
+            # tenant container boots — that is transient and deserves a wait,
+            # not a verdict.
+            local base_state="" probe_ok="" attempt=0
+            local probe_attempts="${DB_PROBE_ATTEMPTS:-10}" probe_delay="${DB_PROBE_DELAY:-3}"
+            while [ "$attempt" -lt "$probe_attempts" ]; do
+                if echo "SELECT 1;" | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA >/dev/null 2>&1; then
+                    probe_ok=1
+                    break
+                fi
+                attempt=$(( attempt + 1 ))
+                [ "$attempt" -lt "$probe_attempts" ] && sleep "$probe_delay"
+            done
+            if [ "$attempt" -gt 0 ] && [ -n "$probe_ok" ]; then
+                log_info "Reached DB '${init_db}' after ${attempt} retry(ies)."
+            fi
+            if [ -n "$probe_ok" ]; then
                 base_state=$(echo "SELECT state FROM ir_module_module WHERE name='base';" | \
                     PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" -tA 2>/dev/null | xargs) || base_state=""
                 if [ "$base_state" = "installed" ]; then
@@ -762,7 +809,16 @@ initialize_database() {
                     fi
                 fi
             else
-                log_warn "Could not connect to existing DB '${init_db}' to verify completeness (transient?). Proceeding to serve it as before; will re-verify on next boot."
+                # Fail CLOSED. "Serve it as before" was never a real option: a
+                # database this script cannot reach after ${probe_attempts}
+                # attempts is one Odoo cannot reach either, so carrying on only
+                # traded a clear error for an opaque one — the container came up
+                # "healthy", answered the health check, and served 500s. Worse,
+                # an unverified DB may be the half-initialized case this block
+                # exists to detect.
+                set_state "DB_UNREACHABLE"
+                log_error "Cannot reach existing DB '${init_db}' at ${db_host}:${db_port} after ${probe_attempts} attempt(s) over $(( probe_attempts * probe_delay ))s. Refusing to start against a database that cannot be verified. Check the shared PostgreSQL/PgBouncer service and the tenant role's credentials, then restart."
+                return 1
             fi
         fi
 
