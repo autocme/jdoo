@@ -16,7 +16,10 @@ services:
   # Shared Postgres — reachable only on pg-backend (no published port).
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:17
+    # Pinned by default so an upstream major cannot land unannounced on a
+    # node that was working. Override with PG_IMAGE_TAG; the value is a
+    # deliberate choice either way.
+    image: postgres:${PG_IMAGE_TAG:-17}
     container_name: shared-postgres
     restart: unless-stopped
     environment:
@@ -60,7 +63,7 @@ services:
   # Reachable by tenants on pg-net as `shared-pgbouncer:6432`. :6432 NOT published.
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: edoburu/pgbouncer:v1.23.1-p3
+    image: edoburu/pgbouncer:${PGBOUNCER_IMAGE_TAG:-v1.23.1-p3}
     container_name: shared-pgbouncer
     restart: unless-stopped
     depends_on:
