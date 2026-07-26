@@ -47,6 +47,14 @@ log_error() {
 }
 
 # Validate package name (pip/npm) — reject anything that could be shell/code injection
+# Quote a value as a PostgreSQL string literal. The admin password hash is
+# pbkdf2-sha512 and contains '$' — and nothing guaranteed it could not contain
+# a single quote, which would have ended the literal early and turned the rest
+# of the hash into SQL. Doubling the quotes is the standard-conforming escape.
+_sql_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
 validate_package_name() {
     local pkg="$1"
     # Allow: letters, digits, hyphen, underscore, dot, brackets (extras), version specs (==, >=, <=, ~=, !=)
@@ -918,15 +926,33 @@ initialize_database() {
     if [ -n "$init_password_hash" ]; then
         # Direct hash injection — the hash (pbkdf2-sha512) is base64-encoded
         # to survive Docker Compose .env interpolation (hash contains $).
+        # Every failure below used to be a warning, and the boot continued. The
+        # consequence was never small: odoo-bin has just created the database
+        # with admin/admin, so "could not set the password" means the tenant is
+        # published to the internet with the default credentials. A tenant whose
+        # password we failed to set must not serve traffic.
         local decoded_hash
         decoded_hash=$(echo "$init_password_hash" | base64 -d 2>/dev/null)
-        if [ -n "$decoded_hash" ]; then
-            echo "UPDATE res_users SET password = '$decoded_hash' WHERE id = 2;" | \
-                PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$init_db" \
-                2>/dev/null && log_info "  Password hash set." || log_warn "  Could not set password hash"
-        else
-            log_warn "  Could not decode INIT_PASSWORD_HASH (invalid base64)"
+        if [ -z "$decoded_hash" ]; then
+            set_state "ADMIN_PASSWORD_FAILED"
+            log_error "INIT_PASSWORD_HASH is not valid base64. The database was created with the default admin/admin credentials and MUST NOT be served. Fix the value and restart."
+            return 1
         fi
+        # ON_ERROR_STOP makes psql exit non-zero on a SQL error, and the row
+        # count is checked because an UPDATE matching nothing is a successful
+        # statement: without this, a missing or renumbered admin user read as
+        # "password set" while the default stood.
+        local update_out
+        update_out=$(printf "UPDATE res_users SET password = %s WHERE id = 2;" \
+                        "$(_sql_quote "$decoded_hash")" | \
+            PGPASSWORD="$db_password" psql -v ON_ERROR_STOP=1 -h "$db_host" \
+                -p "$db_port" -U "$db_user" -d "$init_db" -tA 2>&1)
+        if [ "$(printf '%s' "$update_out" | tr -d '[:space:]')" != "UPDATE1" ]; then
+            set_state "ADMIN_PASSWORD_FAILED"
+            log_error "Failed to apply INIT_PASSWORD_HASH (psql said: ${update_out}). The database still carries the default admin/admin credentials; refusing to serve it."
+            return 1
+        fi
+        log_info "  Password hash set."
     elif [ "$init_password" != "admin" ]; then
         # Fallback: set plain-text password via ORM (Odoo hashes it)
         _INITDB_NAME="$init_db" \
@@ -945,7 +971,13 @@ with registry.cursor() as cr:
     admin.password = os.environ['_INITDB_PASSWORD']
     cr.commit()
 print('OK')
-" 2>&1 && log_info "  Password set." || log_warn "  Could not set password via ORM, using SQL fallback."
+" 2>&1 && log_info "  Password set." || {
+            # There is no SQL fallback after this point — the old message said
+            # there was, and the boot continued with admin/admin.
+            set_state "ADMIN_PASSWORD_FAILED"
+            log_error "Could not set the admin password via the ORM. The database still carries the default admin/admin credentials; refusing to serve it."
+            return 1
+        }
     fi
 
     # Set phone number if provided
