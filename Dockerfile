@@ -36,6 +36,9 @@ RUN set -eux; \
         libharfbuzz-dev libfribidi-dev libxcb1-dev \
         libffi-dev libssl-dev \
         libblas-dev liblapack-dev \
+        # Barcode rasterising: pycairo has no Linux wheel on PyPI, so it is
+        # always compiled here (reportlab 4.x needs it, see CUA_PY_PACKAGES)
+        libcairo2-dev \
     ; \
     rm -rf /var/lib/apt/lists/*
 
@@ -106,8 +109,18 @@ RUN set -eux; \
 # Async platform deps (temporalio, dramatiq, redis) are baked here so they
 # survive container recreate instead of being re-fetched every boot via
 # PY_INSTALL. PY_INSTALL still works and can add more packages at runtime.
+#
+# rlPyCairo/pycairo/freetype-py are NOT optional extras. reportlab 4.x dropped
+# its bundled C rasteriser, so without a backend every /report/barcode/ request
+# answers 500 and wkhtmltopdf aborts the whole PDF with UnknownContentError —
+# which is why a ZATCA invoice printed unstyled while a report without a QR
+# printed fine. Odoo's requirements.txt does not carry them: its own comment
+# says the backend arrives "included in deb package", and this image is
+# python-slim + pip, so nothing supplies it. Versions are bounded by reportlab
+# 4.1.0 itself, which pins freetype-py <2.4 and rlPyCairo <1 for this extra —
+# so freetype-py stays at 2.3.0 even though 2.5.1 exists.
 # -----------------------------------------------------------------------------
-ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains==0.0.229 email-validator==2.3.0 feedparser hijridate==2.6.0 html2text==2025.4.15 httpx pdfminer.six==20260107 pdfplumber rapidfuzz temporalio dramatiq redis moyasar==0.6.5 arabic-reshaper==3.0.1 inflect==7.5.0 pikepdf==10.10.0"
+ARG CUA_PY_PACKAGES="PyJWT asyncssh==2.21.1 disposable-email-domains==0.0.229 email-validator==2.3.0 feedparser hijridate==2.6.0 html2text==2025.4.15 httpx pdfminer.six==20260107 pdfplumber rapidfuzz temporalio dramatiq redis moyasar==0.6.5 arabic-reshaper==3.0.1 inflect==7.5.0 pikepdf==10.10.0 rlPyCairo==0.4.0 pycairo==1.29.1 freetype-py==2.3.0"
 RUN set -eux; \
     MAJOR=$(echo "${ODOO_VERSION}" | cut -d. -f1); \
     PKGS="${CUA_PY_PACKAGES}"; \
@@ -193,6 +206,10 @@ RUN set -eux; \
         # Text rendering (RTL languages, Arabic, etc.)
         libharfbuzz0b \
         libfribidi0 \
+        # Barcode/QR rasterising: pycairo is copied in with /usr/local/lib but
+        # links against this system library, so leaving it out breaks reports
+        # exactly as if the package were never installed.
+        libcairo2 \
         # X11
         libxcb1 \
         # Other runtime libs
