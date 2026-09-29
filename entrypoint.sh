@@ -486,15 +486,24 @@ generate_config() {
     while IFS='=' read -r name value; do
         if [[ "$name" == conf.* ]]; then
             key="${name#conf.}"
-            # limit_time_real_cron = 0 means "no limit", and Odoo documents it
-            # that way (`--limit-time-real-cron ... Set to 0 for no limit`). It
-            # arrived in this repo's first commit alongside limit_time_cpu 600 and
-            # limit_time_real 1200, and the intent reads clearly: Odoo's own
-            # default (-1) means "use limit_time_real", which would kill a
-            # legitimate long cron — a month-end close, a large import, a mass
-            # mailing — after 20 minutes.
+            # limit_time_real_cron = 0 means "no limit". Odoo documents the value
+            # (`--limit-time-real-cron ... Set to 0 for no limit`), but it is an
+            # opt-OUT: upstream's own default is -1, i.e. "use limit_time_real" —
+            # a bound. Production guidance is likewise a bounded value; the one
+            # widely-cited reason to set 0 is an OCA-style jobrunner living inside
+            # a cron worker, which must not be killed mid-run.
             #
-            # What changed is the cost, not the value. In prefork mode
+            # This platform does not have that. Verified across all 16 tenants on
+            # 2026-09-29: none sets server_wide_modules, and the single tenant with
+            # j_queue_pro dispatches through Redis with 1- and 5-minute crons whose
+            # only long loop (autovacuum) commits per batch, so a kill costs nothing
+            # already done. So 0 here was an unguarded default, not a considered
+            # choice — it arrived in this repo's first commit beside
+            # limit_time_cpu 600 and limit_time_real 1200, with no rationale
+            # recorded anywhere.
+            #
+            # And the cost is much higher on this platform than on a single box. In
+            # prefork mode
             # service/server.py does `config['limit_time_real_cron'] or None`, so 0
             # leaves WorkerCron with no watchdog_timeout at all: a worker wedged on
             # a query is never killed. On a tenant's own database that only delays
