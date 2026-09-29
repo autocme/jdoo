@@ -37,9 +37,15 @@ services:
     # never runs a bare `up -d` on a node where postgres is already running: it
     # prints a notice and leaves the recreate to a maintenance window.
     # The reloadable half of this list (random_page_cost, every log_*) can be
-    # applied live with `ALTER SYSTEM ... ; SELECT pg_reload_conf();` — but note
-    # postgresql.auto.conf is read LAST and would then shadow these args forever,
-    # so ALTER SYSTEM RESET them once the recreate has happened.
+    # applied live with `ALTER SYSTEM ... ; SELECT pg_reload_conf();` on a node that
+    # is not yet running them from here. 🔴 Precedence, measured on jaah-w1
+    # 2026-09-29, NOT the other way round: a `-c` argument on this command line
+    # OUTRANKS postgresql.auto.conf. An ALTER SYSTEM for a key that is already on
+    # the command line is silently INERT — effective_cache_size was set to 65GB in
+    # auto.conf and the running value stayed 3GB with source='command line'. So
+    # once a key appears above, the live value comes from here; an ALTER SYSTEM
+    # entry for it is at best dead config and at worst a landmine that springs the
+    # day the argument is removed.
     command:
       - postgres
       - -c
