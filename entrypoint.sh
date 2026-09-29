@@ -486,6 +486,38 @@ generate_config() {
     while IFS='=' read -r name value; do
         if [[ "$name" == conf.* ]]; then
             key="${name#conf.}"
+            # limit_time_real_cron = 0 means "no limit", and Odoo documents it
+            # that way (`--limit-time-real-cron ... Set to 0 for no limit`). It
+            # arrived in this repo's first commit alongside limit_time_cpu 600 and
+            # limit_time_real 1200, and the intent reads clearly: Odoo's own
+            # default (-1) means "use limit_time_real", which would kill a
+            # legitimate long cron — a month-end close, a large import, a mass
+            # mailing — after 20 minutes.
+            #
+            # What changed is the cost, not the value. In prefork mode
+            # service/server.py does `config['limit_time_real_cron'] or None`, so 0
+            # leaves WorkerCron with no watchdog_timeout at all: a worker wedged on
+            # a query is never killed. On a tenant's own database that only delays
+            # that tenant. On a SHARED pooler it holds one of a bounded per-tenant
+            # set of server connections for ever — and its permanent LISTEN session
+            # sits on the same `postgres` database whose saturation took every
+            # tenant's login down on 2026-09-28.
+            #
+            # 3600 keeps the original intent (an hour is far above any real batch)
+            # and gives the watchdog back. The kill is self-healing: the prefork
+            # master respawns the worker and start() re-issues LISTEN.
+            #
+            # Corrected HERE rather than only in this repo's compose because an
+            # orchestrator (Dokploy) stores its OWN copy of the compose file and
+            # writes it over the git checkout on every deploy, so a tenant created
+            # before the change keeps handing us 0 whatever the repo says.
+            # Measured on jaah-w1 2026-09-29, in the deploy log itself.
+            # -1 and any positive value are honoured untouched, and an operator who
+            # really wants no limit can still say so with LIMIT_TIME_REAL_CRON=0.
+            if [ "$key" = "limit_time_real_cron" ] && [ "$value" = "0" ]; then
+                value="${LIMIT_TIME_REAL_CRON:-3600}"
+                log_warn "  Config: limit_time_real_cron was 0, which disables the cron watchdog entirely - using ${value}"
+            fi
             echo "${key} = ${value}" >> "$ERP_CONF_PATH"
             log_info "  Config: ${key} = ${value}"
         fi

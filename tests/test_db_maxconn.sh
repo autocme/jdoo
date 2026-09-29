@@ -175,6 +175,38 @@ if [ -n "$cron_limit" ] && [ "$cron_limit" != "0" ]; then pass; else
     fail "limit_time_real_cron default is '${cron_limit:-unset}' — 0 disables the watchdog"
 fi
 
+describe "the cron watchdog cannot be left disabled"
+
+it "a conf.limit_time_real_cron of 0 is corrected at config generation"
+# Measured on production 2026-09-29: Dokploy stores its OWN copy of the compose
+# file and writes it over the git checkout on every deploy, so a tenant created
+# before this fix keeps handing the container `conf.limit_time_real_cron: 0` no
+# matter what this repo's compose says. 0 disables the watchdog outright
+# (service/server.py: `config[...] or None`), so the entrypoint corrects it.
+load_functions_from "$ROOT/entrypoint.sh" generate_config >/dev/null 2>&1 || true
+fresh_conf
+( export ERP_CONF_PATH; env -i PATH="$PATH" ERP_CONF_PATH="$ERP_CONF_PATH" \
+    conf.limit_time_real_cron=0 conf.db_name=sub1 \
+    bash -c "$(extract_function log_info); $(extract_function log_warn); $(extract_function set_state); $(extract_function generate_config); generate_config" ) >/dev/null 2>&1
+val=$(conf_value limit_time_real_cron)
+if [ -n "$val" ] && [ "$val" != "0" ]; then pass; else
+    fail "limit_time_real_cron came out as '${val:-unset}' — the watchdog stays disabled"
+fi
+
+it "a deliberate positive value is left alone"
+fresh_conf
+( env -i PATH="$PATH" ERP_CONF_PATH="$ERP_CONF_PATH" \
+    conf.limit_time_real_cron=7200 conf.db_name=sub1 \
+    bash -c "$(extract_function log_info); $(extract_function log_warn); $(extract_function set_state); $(extract_function generate_config); generate_config" ) >/dev/null 2>&1
+assert_equals "$(conf_value limit_time_real_cron)" "7200"
+
+it "-1 (use limit_time_real) is left alone"
+fresh_conf
+( env -i PATH="$PATH" ERP_CONF_PATH="$ERP_CONF_PATH" \
+    conf.limit_time_real_cron=-1 conf.db_name=sub1 \
+    bash -c "$(extract_function log_info); $(extract_function log_warn); $(extract_function set_state); $(extract_function generate_config); generate_config" ) >/dev/null 2>&1
+assert_equals "$(conf_value limit_time_real_cron)" "-1"
+
 describe "idempotency"
 
 it "applying twice leaves one line each"
