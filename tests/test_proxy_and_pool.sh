@@ -265,8 +265,46 @@ pg_max=$(grep -oE 'max_connections=\$\{PG_MAX_CONNECTIONS:-[0-9]+\}' "$COMPOSE" 
 su_res=$(grep -oE 'superuser_reserved_connections=\$\{PG_SUPERUSER_RESERVED:-[0-9]+\}' "$COMPOSE" | grep -oE '[0-9]+$')
 [ -z "$su_res" ] && su_res=10
 
+# Tenants named explicitly in [databases] leave the wildcard ceiling and get
+# their own bucket, so the budget cannot charge every tenant the wildcard cap.
+# Discovered from the file rather than listed here, so adding an entry updates
+# the arithmetic instead of silently invalidating it.
+explicit_tenants=$(grep -oE '^sub[0-9]+ *=' "$PGB_INI" | tr -d ' =' | sort -u)
+explicit_n=$(printf '%s\n' "$explicit_tenants" | grep -c . || true)
+explicit_sum=0
+explicit_max=$tenant_cap
+for t in $explicit_tenants; do
+    c=$(pgb_db_key "$t" max_db_connections)
+    explicit_sum=$(( explicit_sum + c ))
+    [ "$c" -gt "$explicit_max" ] && explicit_max=$c
+done
+
+it "every explicitly named tenant carries a complete set of limits"
+for t in $explicit_tenants; do
+    for k in pool_size reserve_pool max_db_connections; do
+        if [ -z "$(pgb_db_key "$t" "$k")" ]; then
+            fail "$t is named explicitly but has no $k — it would inherit nothing"
+            break 2
+        fi
+    done
+done
+pass
+
+it "an explicitly named tenant can reach its own reserve"
+for t in $explicit_tenants; do
+    p=$(pgb_db_key "$t" pool_size); r=$(pgb_db_key "$t" reserve_pool)
+    c=$(pgb_db_key "$t" max_db_connections)
+    if [ $(( p + r )) -ne "$c" ]; then
+        fail "$t: pool_size+reserve_pool ($(( p + r ))) must equal max_db_connections ($c)"
+        break
+    fi
+done
+pass
+
 it "the whole budget fits under max_connections minus the superuser reserve"
-total=$(( tenant_cap * MAX_TENANTS_PER_NODE + pg_cap + auth_cap ))
+# The wildcard only has to fund the tenants that are NOT named explicitly.
+wildcard_n=$(( MAX_TENANTS_PER_NODE - explicit_n ))
+total=$(( tenant_cap * wildcard_n + explicit_sum + pg_cap + auth_cap ))
 assert_lt "$total" $(( pg_max - su_res ))
 
 it "no tenant can take another tenant's share of the maintenance database"
@@ -280,7 +318,11 @@ reserve=$(pgb_global reserve_pool_size)
 assert_ge "$tenant_cap" $(( pool + reserve ))
 
 it "the per-role ceiling never binds before the per-database ones"
-assert_ge "$(pgb_global max_user_connections)" $(( tenant_cap + pgb_pool + pgb_res ))
+# Measured against the LARGEST tenant bucket, not the wildcard one: a role with
+# its own 30-connection entry needs 30 + its share of `postgres`, and a
+# max_user_connections below that would throttle it while every per-database cap
+# still had room — undoing the explicit entry without changing it.
+assert_ge "$(pgb_global max_user_connections)" $(( explicit_max + pgb_pool + pgb_res ))
 
 describe "#OUTAGE — the pidfile restart-loop cannot recur"
 
