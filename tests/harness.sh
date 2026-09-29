@@ -54,6 +54,20 @@ load_functions() {
     done
 }
 
+# Load functions from a DIFFERENT script (e.g. healthcheck.sh), which has no
+# logging helpers of its own. ENTRYPOINT is restored afterwards so a test file
+# can mix both sources.
+load_functions_from() {
+    local file="$1"; shift
+    local saved="$ENTRYPOINT"
+    ENTRYPOINT="$file"
+    local name
+    for name in "$@"; do
+        eval "$(extract_function "$name")"
+    done
+    ENTRYPOINT="$saved"
+}
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------

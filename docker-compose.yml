@@ -209,13 +209,27 @@ services:
       conf.proxy_mode: "True"
       conf.limit_time_cpu: 600
       conf.limit_time_real: 1200
-      conf.limit_time_real_cron: 0
+      # NOT 0. service/server.py does `config['limit_time_real_cron'] or None`,
+      # so 0 becomes None and WorkerCron.watchdog_timeout is disabled OUTRIGHT:
+      # a cron worker wedged on a query is never killed and holds both its
+      # tenant-DB session and its permanent LISTEN session on `postgres` forever.
+      # 3600s is above any real Odoo batch (valuation, mass mailing, month-end)
+      # and the kill is self-healing — the prefork master respawns the worker and
+      # start() re-issues LISTEN cron_trigger. -1 would mean "use limit_time_real".
+      conf.limit_time_real_cron: ${LIMIT_TIME_REAL_CRON:-3600}
 
       # Resource allocation (auto-computed in entrypoint, override via .env)
       WORKERS: ${WORKERS:-}
       MAX_CRON_THREADS: ${MAX_CRON_THREADS:-}
       LIMIT_MEMORY_SOFT: ${LIMIT_MEMORY_SOFT:-}
       LIMIT_MEMORY_HARD: ${LIMIT_MEMORY_HARD:-}
+      # Per-PROCESS client-pool ceilings. Deliberately passed through empty so the
+      # default lives in exactly one place (entrypoint.sh compute_resources: 8 and
+      # 12) and a plain `docker run` user gets it too. Do NOT set conf.db_maxconn
+      # here: generate_config writes conf.* keys first and apply_resources skips
+      # a key it finds, so a value here would silently shadow the computed one.
+      DB_MAXCONN: ${DB_MAXCONN:-}
+      DB_MAXCONN_GEVENT: ${DB_MAXCONN_GEVENT:-}
       RESOURCE_WATCHER: ${RESOURCE_WATCHER:-FALSE}
 
       # -------------------------------------------------------------------
@@ -244,7 +258,17 @@ services:
       PY_INSTALL: ${PY_INSTALL:-phonenumbers,python-stdnum,num2words}
       NPM_INSTALL: ${NPM_INSTALL:-rtlcss,less}
 
+    # The gevent worker holds one fd per live websocket, so the inherited 1024
+    # soft limit is a real ceiling for a busy tenant.
+    ulimits:
+      nofile:
+        soft: ${ODOO_NOFILE:-65536}
+        hard: ${ODOO_NOFILE:-65536}
     healthcheck:
+      # Two cheap probes: /web/health (the WSGI stack) then a db-only route (the
+      # tenant database). See healthcheck.sh for why /web/login was wrong in both
+      # directions — it 303'd to the database selector and scored HEALTHY, and it
+      # opened two `postgres` sessions every 15s per tenant.
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 15s
       timeout: 10s

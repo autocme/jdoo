@@ -326,6 +326,29 @@ compute_resources() {
         log_info "  Cron threads: ${max_cron_threads} (auto)"
     fi
 
+    # --- DB connection ceilings (PER PROCESS) ---
+    # Odoo's db_maxconn sizes each PROCESS's own client-side connection pool
+    # (odoo/sql_db.py: one ConnectionPool per process, plus a readonly one), and
+    # db_maxconn_gevent overrides it for the gevent worker. Upstream defaults to
+    # 64, which on a shared PgBouncer is an unbounded ceiling: a single tenant's
+    # pathological worst case is (workers + cron + gevent) x 64 client
+    # connections, and in pool_mode=session every OPEN client connection holds a
+    # server slot for its whole life. Normal usage is driven by concurrency, not
+    # by this ceiling — a prefork HTTP worker handles one request at a time, and
+    # a production tenant measures 6-9 server connections in total — so this is
+    # a bound on the pathological case, not a throughput knob.
+    #   8  per HTTP/cron process: 4x the 2-cursors-per-thread Odoo itself assumes
+    #      (service/server.py max_http_threads), so PoolError stays unreachable.
+    #   12 for gevent: it serves many concurrent greenlets on sub-millisecond
+    #      cursors, so it legitimately needs more than an HTTP worker. Without
+    #      this key it would inherit db_maxconn (sql_db.py) and be strangled.
+    # Override per tenant with DB_MAXCONN / DB_MAXCONN_GEVENT (NOT with
+    # conf.db_maxconn: that is written by generate_config and would silently win
+    # over this block, leaving two sources of truth for one ceiling).
+    local db_maxconn="${DB_MAXCONN:-8}"
+    local db_maxconn_gevent="${DB_MAXCONN_GEVENT:-12}"
+    log_info "  DB maxconn: ${db_maxconn}/process (gevent ${db_maxconn_gevent})"
+
     # --- Memory Limits (per worker) ---
     # Odoo's limit_memory_soft/hard are PER WORKER limits
     # Formula: allocate 85% of RAM across all processes
@@ -393,6 +416,8 @@ compute_resources() {
     COMPUTED_MAX_CRON_THREADS="${max_cron_threads}"
     COMPUTED_LIMIT_MEMORY_SOFT="${limit_memory_soft}"
     COMPUTED_LIMIT_MEMORY_HARD="${limit_memory_hard}"
+    COMPUTED_DB_MAXCONN="${db_maxconn}"
+    COMPUTED_DB_MAXCONN_GEVENT="${db_maxconn_gevent}"
 
     # Summary using Odoo's official formula:
     # RAM = total_procs * ((0.8 * 150MB) + (0.2 * 1024MB)) = ~325MB/proc (light avg)
@@ -433,6 +458,17 @@ apply_resources() {
     if ! grep -q "^limit_memory_hard" "$ERP_CONF_PATH" 2>/dev/null; then
         echo "limit_memory_hard = ${COMPUTED_LIMIT_MEMORY_HARD}" >> "$ERP_CONF_PATH"
         log_info "  Config: limit_memory_hard = ${COMPUTED_LIMIT_MEMORY_HARD}"
+    fi
+    # Anchored on '=' on purpose: a bare "^db_maxconn" would also match
+    # db_maxconn_gevent, so an operator who set only the gevent key would silently
+    # lose the per-process ceiling.
+    if ! grep -q "^db_maxconn *=" "$ERP_CONF_PATH" 2>/dev/null; then
+        echo "db_maxconn = ${COMPUTED_DB_MAXCONN}" >> "$ERP_CONF_PATH"
+        log_info "  Config: db_maxconn = ${COMPUTED_DB_MAXCONN}"
+    fi
+    if ! grep -q "^db_maxconn_gevent *=" "$ERP_CONF_PATH" 2>/dev/null; then
+        echo "db_maxconn_gevent = ${COMPUTED_DB_MAXCONN_GEVENT}" >> "$ERP_CONF_PATH"
+        log_info "  Config: db_maxconn_gevent = ${COMPUTED_DB_MAXCONN_GEVENT}"
     fi
 }
 

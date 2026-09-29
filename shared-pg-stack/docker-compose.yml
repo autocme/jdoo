@@ -30,12 +30,26 @@ services:
       # Consumed by init/00-auth.sh (first boot) to create the pgbouncer_auth role
       # with the SAME password PgBouncer will present from its userlist.
       AUTH_PASS: ${AUTH_PASS:?AUTH_PASS required}
+    # 🔴 Every key in `command:`, `ulimits:` and `shm_size:` is part of this
+    # service's compose config hash. Changing any of them means the next
+    # `docker compose up -d` DESTROYS AND RECREATES PostgreSQL, dropping every
+    # session on the node — all tenants at once. That is why step_saas_shared_pg
+    # never runs a bare `up -d` on a node where postgres is already running: it
+    # prints a notice and leaves the recreate to a maintenance window.
+    # The reloadable half of this list (random_page_cost, every log_*) can be
+    # applied live with `ALTER SYSTEM ... ; SELECT pg_reload_conf();` — but note
+    # postgresql.auto.conf is read LAST and would then shadow these args forever,
+    # so ALTER SYSTEM RESET them once the recreate has happened.
     command:
       - postgres
       - -c
       - max_connections=${PG_MAX_CONNECTIONS:-500}
+      # Keep in sync with the CAPACITY BUDGET header in pgbouncer.ini: the pool
+      # ceilings are sized against (max_connections - superuser_reserved).
+      # The reserve is what let the control plane still reach the cluster over
+      # the local socket while PgBouncer was saturated and diagnose the outage.
       - -c
-      - superuser_reserved_connections=10
+      - superuser_reserved_connections=${PG_SUPERUSER_RESERVED:-10}
       - -c
       - shared_buffers=${PG_SHARED_BUFFERS:-1GB}
       - -c
@@ -46,11 +60,90 @@ services:
       - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}
       - -c
       - password_encryption=scram-sha-256
+      # --- Planner: these nodes are NVMe/SSD. The default 4.0 is a spinning-disk
+      # number and makes the planner prefer sequential scans over index scans on
+      # exactly the narrow lookups Odoo does most.
+      - -c
+      - random_page_cost=${PG_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - effective_io_concurrency=${PG_EFFECTIVE_IO_CONCURRENCY:-200}
+      # --- Forensics. There was NO trail when the fleet lost logins on
+      # 2026-09-28: the reconstruction had to come from container restart counts
+      # and live pool counters. logging_collector stays OFF on purpose — stderr
+      # is what Docker captures and rotates (see the `logging:` block below); a
+      # collector would bury the log inside PGDATA where nothing rotates it.
+      - -c
+      - logging_collector=off
+      - -c
+      - log_destination=stderr
+      # The image default prefix is "%m [%p] " — no role, no database, no
+      # application_name, so a line cannot be attributed to a tenant. Odoo sets
+      # application_name via db_app_name, so %a names the process too.
+      # The trailing space is significant.
+      - -c
+      - "log_line_prefix=%m [%p] %q%u@%d/%a "
+      - -c
+      - log_timezone=${PG_LOG_TIMEZONE:-UTC}
+      # Who connected, as which role, to which database, and for how long. The
+      # single most useful pair for this incident class, and cheap: with session
+      # pooling (server_lifetime 3600) backend churn is a few hundred an hour,
+      # not per request.
+      - -c
+      - log_connections=${PG_LOG_CONNECTIONS:-on}
+      - -c
+      - log_disconnections=${PG_LOG_DISCONNECTIONS:-on}
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION:-1000}
+      - -c
+      - log_lock_waits=${PG_LOG_LOCK_WAITS:-on}
+      # DDL only: catches tenant provisioning/teardown and module installs.
+      # Never `all` — that is the flood.
+      - -c
+      - log_statement=${PG_LOG_STATEMENT:-ddl}
+      - -c
+      - log_temp_files=${PG_LOG_TEMP_FILES:-8MB}
+      - -c
+      - log_autovacuum_min_duration=${PG_LOG_AUTOVACUUM_MIN_DURATION:-10s}
+      # pg_stat_activity.query is truncated at 1024 by default, which cuts every
+      # interesting Odoo query in half exactly when you need to read it.
+      - -c
+      - track_activity_query_size=${PG_TRACK_ACTIVITY_QUERY_SIZE:-4096}
+      # Reap backends whose PgBouncer side vanished without a FIN. Mirrors the
+      # tcp_keepalive_* block in pgbouncer.ini.
+      - -c
+      - tcp_keepalives_idle=${PG_TCP_KEEPALIVES_IDLE:-60}
+      - -c
+      - tcp_keepalives_interval=${PG_TCP_KEEPALIVES_INTERVAL:-10}
+      - -c
+      - tcp_keepalives_count=${PG_TCP_KEEPALIVES_COUNT:-6}
+      # A session idle IN TRANSACTION is a leak; 15 min is far above any real
+      # Odoo module install. 🔴 NEVER set idle_session_timeout — that would kill
+      # the permanent LISTEN sessions, which are idle by definition.
+      - -c
+      - idle_in_transaction_session_timeout=${PG_IDLE_IN_TXN_TIMEOUT:-900000}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
     networks:
       - pg-backend
+    # The inherited soft nofile limit is 1024 (DefaultLimitNOFILE is 524288 hard
+    # / 1024 soft and no unit raises the soft limit). A backend with many
+    # relations open plus max_files_per_process=1000 sits right on that edge.
+    ulimits:
+      nofile:
+        soft: ${PG_NOFILE:-65536}
+        hard: ${PG_NOFILE:-65536}
+    # Default /dev/shm is 64MB. dynamic_shared_memory_type=posix puts parallel
+    # query segments there, so parallel plans fail with "could not resize shared
+    # memory segment" on a box that otherwise looks fine. shared_buffers does
+    # NOT live here.
+    shm_size: ${PG_SHM_SIZE:-1gb}
+    # Logging is now on. Without rotation that is a disk-full outage.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${PG_LOG_MAX_SIZE:-50m}"
+        max-file: "${PG_LOG_MAX_FILE:-5}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 10s
@@ -84,6 +177,19 @@ services:
         printf '"pgbouncer_auth" "%s"\n' "$$AUTH_PASS" > /tmp/userlist.txt
         chmod 600 /tmp/userlist.txt
         exec pgbouncer /etc/pgbouncer/pgbouncer.ini
+    # 🔴 A SINGLE-FILE bind mount binds by INODE. A host-side edit that replaces
+    # the file (sed -i, git reset --hard) leaves this container holding the old
+    # inode, and a PgBouncer RELOAD then re-reads stale content and reports
+    # success. Measured on jaah-w1 2026-09-28: host inode carried
+    # max_db_connections=120 while the container still served 60. The only way to
+    # deliver a changed pgbouncer.ini is
+    #   docker compose up -d --force-recreate --no-deps pgbouncer
+    # (--force-recreate because a bind-mounted file's CONTENT is not part of the
+    # compose config hash, so a plain `up -d` is a no-op; --no-deps because
+    # without it compose recreates `postgres` too and drops every session on the
+    # node). A `docker restart` is not enough either: it reuses the writable
+    # layer, which is how a stale /tmp/pgbouncer.pid used to wedge this container
+    # permanently.
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
     networks:
@@ -91,6 +197,21 @@ services:
       pg-net:
         aliases:
           - shared-pgbouncer
+    # max_client_conn=2000 needs roughly one fd per client plus one per server
+    # connection plus the listeners. At the inherited 1024 soft limit the real
+    # client ceiling is ~500 for the WHOLE node, and it fails as
+    # "accept() failed: Too many open files" with no hint that fds are the cause.
+    # PgBouncer prints its own verdict at startup: grep the log for
+    # "file descriptor limit".
+    ulimits:
+      nofile:
+        soft: ${PGBOUNCER_NOFILE:-65536}
+        hard: ${PGBOUNCER_NOFILE:-65536}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${PGBOUNCER_LOG_MAX_SIZE:-50m}"
+        max-file: "${PGBOUNCER_LOG_MAX_FILE:-5}"
     healthcheck:
       # Port-listen probe (busybox nc). Full path is exercised by the live test matrix
       # (SHOW POOLS / a tenant connect through 6432).
